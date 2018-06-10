@@ -33,8 +33,9 @@
 #endif
 
 /* The tablet sends events every ~2ms , 50ms should be plenty enough to
-   detect out-of-range */
-#define FORCED_PROXOUT_TIMEOUT ms2us(50)
+   detect out-of-range.
+   This value is higher during test suite runs */
+static int FORCED_PROXOUT_TIMEOUT = 50 * 1000; /* µs */
 
 #define tablet_set_status(tablet_,s_) (tablet_)->status |= (s_)
 #define tablet_unset_status(tablet_,s_) (tablet_)->status &= ~(s_)
@@ -1657,12 +1658,15 @@ static void
 tablet_proximity_out_quirk_timer_func(uint64_t now, void *data)
 {
 	struct tablet_dispatch *tablet = data;
+	struct timeval tv = us2tv(now);
 	struct input_event events[2] = {
-		{ .time = us2tv(now),
+		{ .input_event_sec = tv.tv_sec,
+		  .input_event_usec = tv.tv_usec,
 		  .type = EV_KEY,
 		  .code = BTN_TOOL_PEN,
 		  .value = 0 },
-		{ .time = us2tv(now),
+		{ .input_event_sec = tv.tv_sec,
+		  .input_event_usec = tv.tv_usec,
 		  .type = EV_SYN,
 		  .code = SYN_REPORT,
 		  .value = 0 },
@@ -1729,9 +1733,10 @@ tablet_proximity_quirk_update(struct tablet_dispatch *tablet,
 		/* If the timer function forced prox out before,
 		   fake a BTN_TOOL_PEN event */
 		if (tablet->quirks.proximity_out_forced) {
-
+			struct timeval tv = us2tv(time);
 			struct input_event fake_event = {
-				.time = us2tv(time),
+				.input_event_sec = tv.tv_sec,
+				.input_event_usec = tv.tv_usec,
 				.type = EV_KEY,
 				.code = BTN_TOOL_PEN,
 				.value = 1,
@@ -2024,7 +2029,7 @@ tablet_reject_device(struct evdev_device *device)
 		return 0;
 
 	evdev_log_bug_libinput(device,
-			       "missing tablet capabilities:%s%s%s%s."
+			       "missing tablet capabilities:%s%s%s%s. "
 			       "Ignoring this device.\n",
 			       has_xy ? "" : " xy",
 			       has_pen ? "" : " pen",
@@ -2101,6 +2106,10 @@ struct evdev_dispatch *
 evdev_tablet_create(struct evdev_device *device)
 {
 	struct tablet_dispatch *tablet;
+
+	/* Stop false positives caused by the forced proximity code */
+	if (getenv("LIBINPUT_RUNNING_TEST_SUITE"))
+		FORCED_PROXOUT_TIMEOUT = 150 * 1000; /* µs */
 
 	tablet = zalloc(sizeof *tablet);
 

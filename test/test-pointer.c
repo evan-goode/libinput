@@ -2498,7 +2498,6 @@ START_TEST(debounce_spurious_switch_to_otherbutton)
 	litest_timeout_debounce();
 	libinput_dispatch(li);
 
-
 	litest_event(dev, EV_KEY, BTN_LEFT, 0);
 	litest_event(dev, EV_SYN, SYN_REPORT, 0);
 	/* release is now held back,
@@ -2534,8 +2533,7 @@ START_TEST(debounce_spurious_switch_to_otherbutton)
 }
 END_TEST
 
-void
-litest_setup_tests_pointer(void)
+TEST_COLLECTION(pointer)
 {
 	struct range axis_range = {ABS_X, ABS_Y + 1};
 	struct range compass = {0, 7}; /* cardinal directions */

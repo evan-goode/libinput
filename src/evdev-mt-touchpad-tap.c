@@ -312,9 +312,9 @@ tp_tap_tapped_handle_event(struct tp_dispatch *tp,
 			      LIBINPUT_BUTTON_STATE_RELEASED);
 		break;
 	case TAP_EVENT_THUMB:
-	case TAP_EVENT_PALM:
 		log_tap_bug(tp, t, event);
 		break;
+	case TAP_EVENT_PALM:
 	case TAP_EVENT_PALM_UP:
 		break;
 	}
@@ -942,6 +942,13 @@ tp_tap_exceeds_motion_threshold(struct tp_dispatch *tp,
 		return false;
 	}
 
+	/* Semi-mt devices will give us large movements on finger release,
+	 * depending which touch is released. Make sure we ignore any
+	 * movement in the same frame as a finger change.
+	 */
+	if (tp->semi_mt && tp->nfingers_down != tp->old_nfingers_down)
+		return false;
+
 	return length_in_mm(mm) > DEFAULT_TAP_MOVE_THRESHOLD;
 }
 
@@ -1033,6 +1040,9 @@ tp_tap_handle_state(struct tp_dispatch *tp, uint64_t time)
 			}
 			t->tap.state = TAP_TOUCH_STATE_IDLE;
 		} else if (tp->tap.state != TAP_STATE_IDLE &&
+			   t->thumb.state == THUMB_STATE_YES) {
+			tp_tap_handle_event(tp, t, TAP_EVENT_THUMB, time);
+		} else if (tp->tap.state != TAP_STATE_IDLE &&
 			   tp_tap_exceeds_motion_threshold(tp, t)) {
 			struct tp_touch *tmp;
 
@@ -1044,10 +1054,6 @@ tp_tap_handle_state(struct tp_dispatch *tp, uint64_t time)
 			}
 
 			tp_tap_handle_event(tp, t, TAP_EVENT_MOTION, time);
-		} else if (tp->tap.state != TAP_STATE_IDLE &&
-			   t->thumb.state == THUMB_STATE_YES &&
-			   !t->tap.is_thumb) {
-			tp_tap_handle_event(tp, t, TAP_EVENT_THUMB, time);
 		}
 	}
 

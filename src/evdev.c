@@ -441,6 +441,12 @@ evdev_tag_keyboard(struct evdev_device *device,
 	device->tags |= EVDEV_TAG_KEYBOARD;
 }
 
+static void
+evdev_tag_tablet_touchpad(struct evdev_device *device)
+{
+	device->tags |= EVDEV_TAG_TABLET_TOUCHPAD;
+}
+
 static int
 evdev_calibration_has_matrix(struct libinput_device *libinput_device)
 {
@@ -1019,6 +1025,7 @@ evdev_accel_config_set_profile(struct libinput_device *libinput_device,
 		filter_destroy(filter);
 	} else {
 		device->pointer.filter = filter;
+		return LIBINPUT_CONFIG_STATUS_UNSUPPORTED;
 	}
 
 	return LIBINPUT_CONFIG_STATUS_SUCCESS;
@@ -1051,6 +1058,8 @@ evdev_device_init_pointer_acceleration(struct evdev_device *device,
 	device->pointer.filter = filter;
 
 	if (device->base.config.accel == NULL) {
+		double default_speed;
+
 		device->pointer.config.available = evdev_accel_config_available;
 		device->pointer.config.set_speed = evdev_accel_config_set_speed;
 		device->pointer.config.get_speed = evdev_accel_config_get_speed;
@@ -1061,8 +1070,8 @@ evdev_device_init_pointer_acceleration(struct evdev_device *device,
 		device->pointer.config.get_default_profile = evdev_accel_config_get_default_profile;
 		device->base.config.accel = &device->pointer.config;
 
-		evdev_accel_config_set_speed(&device->base,
-			     evdev_accel_config_get_default_speed(&device->base));
+		default_speed = evdev_accel_config_get_default_speed(&device->base);
+		evdev_accel_config_set_speed(&device->base, default_speed);
 	}
 }
 
@@ -1169,8 +1178,7 @@ evdev_get_trackpoint_range(struct evdev_device *device)
 	prop = udev_device_get_property_value(device->udev_device,
 					      "LIBINPUT_ATTR_TRACKPOINT_RANGE");
 	if (prop) {
-		if (!safe_atoi(prop, &range) ||
-		    (range < 0.0 || range > 100)) {
+		if (!safe_atoi(prop, &range) || range < 0.0) {
 			evdev_log_error(device,
 					"trackpoint range property is present but invalid, "
 					"using %d instead\n",
@@ -1179,6 +1187,11 @@ evdev_get_trackpoint_range(struct evdev_device *device)
 		}
 		goto out;
 	}
+
+	evdev_log_info(device,
+		       "trackpoint does not have a specified range, "
+		       "guessing... see %strackpoints.html\n",
+		       HTTP_DOC_LINK);
 
 	prop = udev_device_get_property_value(device->udev_device,
 					      "POINTINGSTICK_SENSITIVITY");
@@ -1195,9 +1208,18 @@ evdev_get_trackpoint_range(struct evdev_device *device)
 		}
 		range = 1.0 * DEFAULT_TRACKPOINT_RANGE *
 			sensitivity/DEFAULT_TRACKPOINT_SENSITIVITY;
+
+		evdev_log_debug(device,
+				"trackpoint udev sensitivity is %d\n",
+				sensitivity);
 	}
 
 out:
+	if (range == 0) {
+		evdev_log_bug_libinput(device, "trackpoint range is zero\n");
+		range = DEFAULT_TRACKPOINT_RANGE;
+	}
+
 	evdev_log_info(device, "trackpoint device set to range %d\n", range);
 	return range;
 }
@@ -1239,7 +1261,6 @@ evdev_read_model_flags(struct evdev_device *device)
 	} model_map[] = {
 #define MODEL(name) { "LIBINPUT_MODEL_" #name, EVDEV_MODEL_##name }
 		MODEL(LENOVO_X230),
-		MODEL(LENOVO_X230),
 		MODEL(LENOVO_X220_TOUCHPAD_FW81),
 		MODEL(CHROMEBOOK),
 		MODEL(SYSTEM76_BONOBO),
@@ -1250,7 +1271,7 @@ evdev_read_model_flags(struct evdev_device *device)
 		MODEL(WACOM_TOUCHPAD),
 		MODEL(ALPS_TOUCHPAD),
 		MODEL(SYNAPTICS_SERIAL_TOUCHPAD),
-		MODEL(JUMPING_SEMI_MT),
+		MODEL(BOUNCING_KEYS),
 		MODEL(CYBORG_RAT),
 		MODEL(HP_STREAM11_TOUCHPAD),
 		MODEL(LENOVO_T450_TOUCHPAD),
@@ -1264,16 +1285,25 @@ evdev_read_model_flags(struct evdev_device *device)
 		MODEL(APPLE_TOUCHPAD_ONEBUTTON),
 		MODEL(LOGITECH_MARBLE_MOUSE),
 		MODEL(TABLET_NO_PROXIMITY_OUT),
-		MODEL(MS_NANO_TRANSCEIVER),
 		MODEL(TABLET_NO_TILT),
+		MODEL(TABLET_MODE_NO_SUSPEND),
+		MODEL(LENOVO_CARBON_X1_6TH),
+		MODEL(LENOVO_SCROLLPOINT),
 #undef MODEL
 		{ "ID_INPUT_TRACKBALL", EVDEV_MODEL_TRACKBALL },
 		{ NULL, EVDEV_MODEL_DEFAULT },
 	};
 	const struct model_map *m = model_map;
 	uint32_t model_flags = 0;
+	uint32_t all_model_flags = 0;
 
 	while (m->property) {
+		/* Check for flag re-use */
+		if (strneq("LIBINPUT_MODEL_", m->property, 15)) {
+			assert((all_model_flags & m->model) == 0);
+			all_model_flags |= m->model;
+		}
+
 		if (parse_udev_flag(device,
 				    device->udev_device,
 				    m->property)) {
@@ -1505,6 +1535,7 @@ static void
 evdev_extract_abs_axes(struct evdev_device *device)
 {
 	struct libevdev *evdev = device->evdev;
+	int fuzz;
 
 	if (!libevdev_has_event_code(evdev, EV_ABS, ABS_X) ||
 	    !libevdev_has_event_code(evdev, EV_ABS, ABS_Y))
@@ -1512,6 +1543,12 @@ evdev_extract_abs_axes(struct evdev_device *device)
 
 	if (evdev_fix_abs_resolution(device, ABS_X, ABS_Y))
 		device->abs.is_fake_resolution = true;
+
+	if ((fuzz = evdev_read_fuzz_prop(device, ABS_X)))
+	    libevdev_set_abs_fuzz(evdev, ABS_X, fuzz);
+	if ((fuzz = evdev_read_fuzz_prop(device, ABS_Y)))
+	    libevdev_set_abs_fuzz(evdev, ABS_Y, fuzz);
+
 	device->abs.absinfo_x = libevdev_get_abs_info(evdev, ABS_X);
 	device->abs.absinfo_y = libevdev_get_abs_info(evdev, ABS_Y);
 	device->abs.dimensions.x = abs(device->abs.absinfo_x->maximum -
@@ -1528,6 +1565,11 @@ evdev_extract_abs_axes(struct evdev_device *device)
 				     ABS_MT_POSITION_X,
 				     ABS_MT_POSITION_Y))
 		device->abs.is_fake_resolution = true;
+
+	if ((fuzz = evdev_read_fuzz_prop(device, ABS_MT_POSITION_X)))
+	    libevdev_set_abs_fuzz(evdev, ABS_MT_POSITION_X, fuzz);
+	if ((fuzz = evdev_read_fuzz_prop(device, ABS_MT_POSITION_Y)))
+	    libevdev_set_abs_fuzz(evdev, ABS_MT_POSITION_Y, fuzz);
 
 	device->abs.absinfo_x = libevdev_get_abs_info(evdev, ABS_MT_POSITION_X);
 	device->abs.absinfo_y = libevdev_get_abs_info(evdev, ABS_MT_POSITION_Y);
@@ -1638,6 +1680,8 @@ evdev_configure_device(struct evdev_device *device)
 	}
 
 	if (udev_tags & EVDEV_UDEV_TAG_TOUCHPAD) {
+		if (udev_tags & EVDEV_UDEV_TAG_TABLET)
+			evdev_tag_tablet_touchpad(device);
 		dispatch = evdev_mt_touchpad_create(device);
 		evdev_log_info(device, "device is a touchpad\n");
 		return dispatch;
@@ -1868,6 +1912,16 @@ evdev_pre_configure_model_quirks(struct evdev_device *device)
 		libevdev_disable_event_code(device->evdev, EV_ABS, ABS_TILT_X);
 		libevdev_disable_event_code(device->evdev, EV_ABS, ABS_TILT_Y);
 	}
+
+	/* Lenovo Carbon X1 6th gen sends bogus ABS_MT_TOOL_TYPE events for
+	 * MT_TOOL_PALM */
+	if (device->model_flags & EVDEV_MODEL_LENOVO_CARBON_X1_6TH)
+		libevdev_disable_event_code(device->evdev,
+					    EV_ABS,
+					    ABS_MT_TOOL_TYPE);
+
+	/* We don't care about them and it can cause unnecessary wakeups */
+	libevdev_disable_event_code(device->evdev, EV_MSC, MSC_TIMESTAMP);
 }
 
 static void
@@ -2162,6 +2216,33 @@ evdev_read_calibration_prop(struct evdev_device *device)
 		       calibration[5]);
 }
 
+int
+evdev_read_fuzz_prop(struct evdev_device *device, unsigned int code)
+{
+	const char *prop;
+	char name[32];
+	int rc;
+	int fuzz = 0;
+
+	rc = snprintf(name, sizeof(name), "LIBINPUT_FUZZ_%02x", code);
+	if (rc == -1)
+		return 0;
+
+	prop = udev_device_get_property_value(device->udev_device, name);
+	if (prop == NULL)
+		return 0;
+
+	rc = safe_atoi(prop, &fuzz);
+	if (rc == -1 || fuzz < 0) {
+		evdev_log_bug_libinput(device,
+				       "invalid LIBINPUT_FUZZ property value: %s\n",
+				       prop);
+		return 0;
+	}
+
+	return fuzz;
+}
+
 bool
 evdev_device_has_capability(struct evdev_device *device,
 			    enum libinput_device_capability capability)
@@ -2222,6 +2303,28 @@ evdev_device_has_key(struct evdev_device *device, uint32_t code)
 		return -1;
 
 	return libevdev_has_event_code(device->evdev, EV_KEY, code);
+}
+
+int
+evdev_device_get_touch_count(struct evdev_device *device)
+{
+	int ntouches;
+
+	if (!(device->seat_caps & EVDEV_DEVICE_TOUCH))
+		return -1;
+
+	ntouches = libevdev_get_num_slots(device->evdev);
+	if (ntouches == -1) {
+		/* mtdev devices have multitouch but we don't know
+		 * how many. Otherwise, any touch device with num_slots of
+		 * -1 is a single-touch device */
+		if (device->mtdev)
+			ntouches = 0;
+		else
+			ntouches = 1;
+	}
+
+	return ntouches;
 }
 
 int

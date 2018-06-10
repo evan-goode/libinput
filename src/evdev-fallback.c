@@ -127,18 +127,16 @@ fallback_filter_defuzz_touch(struct fallback_dispatch *dispatch,
 	if (!dispatch->mt.want_hysteresis)
 		return false;
 
-	point.x = evdev_hysteresis(slot->point.x,
-				   slot->hysteresis_center.x,
-				   dispatch->mt.hysteresis_margin.x);
-	point.y = evdev_hysteresis(slot->point.y,
-				   slot->hysteresis_center.y,
-				   dispatch->mt.hysteresis_margin.y);
+	point = evdev_hysteresis(&slot->point,
+				 &slot->hysteresis_center,
+				 &dispatch->mt.hysteresis_margin);
+	slot->point = point;
 
-	slot->hysteresis_center = slot->point;
-	if (point.x == slot->point.x && point.y == slot->point.y)
+	if (point.x == slot->hysteresis_center.x &&
+	    point.y == slot->hysteresis_center.y)
 		return true;
 
-	slot->point = point;
+	slot->hysteresis_center = point;
 
 	return false;
 }
@@ -213,6 +211,20 @@ fallback_flush_wheels(struct fallback_dispatch *dispatch,
 	if (!(device->seat_caps & EVDEV_DEVICE_POINTER))
 		return;
 
+	if (device->model_flags & EVDEV_MODEL_LENOVO_SCROLLPOINT) {
+		struct normalized_coords unaccel = { 0.0, 0.0 };
+
+		dispatch->wheel.y *= -1;
+		normalize_delta(device, &dispatch->wheel, &unaccel);
+		evdev_post_scroll(device,
+				  time,
+				  LIBINPUT_POINTER_AXIS_SOURCE_CONTINUOUS,
+				  &unaccel);
+		dispatch->wheel.x = 0;
+		dispatch->wheel.y = 0;
+
+		return;
+	}
 
 	if (dispatch->wheel.y != 0) {
 		wheel_degrees.y = -1 * dispatch->wheel.y *
@@ -624,7 +636,7 @@ fallback_lid_keyboard_event(uint64_t time,
 
 static void
 fallback_lid_toggle_keyboard_listener(struct fallback_dispatch *dispatch,
-				      struct paired_keyboard *kbd,
+				      struct evdev_paired_keyboard *kbd,
 				      bool is_closed)
 {
 	assert(kbd->device);
@@ -646,9 +658,9 @@ static void
 fallback_lid_toggle_keyboard_listeners(struct fallback_dispatch *dispatch,
 				       bool is_closed)
 {
-	struct paired_keyboard *kbd;
+	struct evdev_paired_keyboard *kbd;
 
-	ARRAY_FOR_EACH(dispatch->lid.paired_keyboard, kbd) {
+	list_for_each(kbd, &dispatch->lid.paired_keyboard_list, link) {
 		if (!kbd->device)
 			continue;
 
@@ -832,7 +844,6 @@ fallback_handle_state(struct fallback_dispatch *dispatch,
 				slot->state = SLOT_STATE_NONE;
 			}
 
-
 			slot->dirty = false;
 		}
 
@@ -999,15 +1010,15 @@ static void
 fallback_interface_remove(struct evdev_dispatch *evdev_dispatch)
 {
 	struct fallback_dispatch *dispatch = fallback_dispatch(evdev_dispatch);
-	struct paired_keyboard *kbd;
+	struct evdev_paired_keyboard *kbd, *tmp;
 
 	libinput_device_remove_event_listener(&dispatch->tablet_mode.other.listener);
 
-	ARRAY_FOR_EACH(dispatch->lid.paired_keyboard, kbd) {
-		if (!kbd->device)
-			continue;
-
-		libinput_device_remove_event_listener(&kbd->listener);
+	list_for_each_safe(kbd,
+			   tmp,
+			   &dispatch->lid.paired_keyboard_list,
+			   link) {
+		evdev_paired_keyboard_destroy(kbd);
 	}
 }
 
@@ -1084,8 +1095,8 @@ fallback_lid_pair_keyboard(struct evdev_device *lid_switch,
 {
 	struct fallback_dispatch *dispatch =
 		fallback_dispatch(lid_switch->dispatch);
-	struct paired_keyboard *kbd;
-	bool paired = false;
+	struct evdev_paired_keyboard *kbd;
+	size_t count = 0;
 
 	if ((keyboard->tags & EVDEV_TAG_KEYBOARD) == 0 ||
 	    (lid_switch->tags & EVDEV_TAG_LID_SWITCH) == 0)
@@ -1094,30 +1105,30 @@ fallback_lid_pair_keyboard(struct evdev_device *lid_switch,
 	if ((keyboard->tags & EVDEV_TAG_INTERNAL_KEYBOARD) == 0)
 		return;
 
-	ARRAY_FOR_EACH(dispatch->lid.paired_keyboard, kbd) {
-		if (kbd->device)
-			continue;
-
-		kbd->device = keyboard;
-		evdev_log_debug(lid_switch,
-				"lid: keyboard paired with %s<->%s\n",
-				lid_switch->devname,
-				keyboard->devname);
-
-		/* We need to init the event listener now only if the
-		 * reported state is closed. */
-		if (dispatch->lid.is_closed)
-			fallback_lid_toggle_keyboard_listener(
-					      dispatch,
-					      kbd,
-					      dispatch->lid.is_closed);
-		paired = true;
-		break;
+	list_for_each(kbd, &dispatch->lid.paired_keyboard_list, link) {
+		count++;
+		if (count > 3) {
+			evdev_log_info(lid_switch,
+				       "lid: too many internal keyboards\n");
+			break;
+		}
 	}
 
-	if (!paired)
-		evdev_log_bug_libinput(lid_switch,
-				       "lid: too many internal keyboards\n");
+	kbd = zalloc(sizeof(*kbd));
+	kbd->device = keyboard;
+	libinput_device_init_event_listener(&kbd->listener);
+	list_insert(&dispatch->lid.paired_keyboard_list, &kbd->link);
+	evdev_log_debug(lid_switch,
+			"lid: keyboard paired with %s<->%s\n",
+			lid_switch->devname,
+			keyboard->devname);
+
+	/* We need to init the event listener now only if the
+	 * reported state is closed. */
+	if (dispatch->lid.is_closed)
+		fallback_lid_toggle_keyboard_listener(dispatch,
+						      kbd,
+						      dispatch->lid.is_closed);
 }
 
 static void
@@ -1155,7 +1166,6 @@ fallback_tablet_mode_switch_event(uint64_t time,
 	    LIBINPUT_SWITCH_TABLET_MODE)
 		return;
 
-
 	switch (libinput_event_switch_get_switch_state(swev)) {
 	case LIBINPUT_SWITCH_STATE_OFF:
 		fallback_resume(dispatch, device);
@@ -1177,6 +1187,9 @@ fallback_keyboard_pair_tablet_mode(struct evdev_device *keyboard,
 
 	if ((keyboard->tags &
 	     (EVDEV_TAG_TRACKPOINT|EVDEV_TAG_INTERNAL_KEYBOARD)) == 0)
+		return;
+
+	if (keyboard->model_flags & EVDEV_MODEL_TABLET_MODE_NO_SUSPEND)
 		return;
 
 	if ((tablet_mode_switch->tags & EVDEV_TAG_TABLET_MODE_SWITCH) == 0)
@@ -1216,18 +1229,19 @@ fallback_interface_device_removed(struct evdev_device *device,
 {
 	struct fallback_dispatch *dispatch =
 			fallback_dispatch(device->dispatch);
-	struct paired_keyboard *kbd;
+	struct evdev_paired_keyboard *kbd, *tmp;
 
-	ARRAY_FOR_EACH(dispatch->lid.paired_keyboard, kbd) {
+	list_for_each_safe(kbd,
+			   tmp,
+			   &dispatch->lid.paired_keyboard_list,
+			   link) {
 		if (!kbd->device)
 			continue;
 
 		if (kbd->device != removed_device)
 			continue;
 
-		libinput_device_remove_event_listener(&kbd->listener);
-		libinput_device_init_event_listener(&kbd->listener);
-		kbd->device = NULL;
+		evdev_paired_keyboard_destroy(kbd);
 	}
 
 	if (removed_device == dispatch->tablet_mode.other.sw_device) {
@@ -1422,12 +1436,9 @@ fallback_dispatch_init_switch(struct fallback_dispatch *dispatch,
 {
 	int val;
 
+	list_init(&dispatch->lid.paired_keyboard_list);
+
 	if (device->tags & EVDEV_TAG_LID_SWITCH) {
-		struct paired_keyboard *kbd;
-
-		ARRAY_FOR_EACH(dispatch->lid.paired_keyboard, kbd)
-			libinput_device_init_event_listener(&kbd->listener);
-
 		dispatch->lid.reliability = evdev_read_switch_reliability_prop(device);
 		dispatch->lid.is_closed = false;
 	}
@@ -1453,6 +1464,7 @@ fallback_dispatch_create(struct libinput_device *libinput_device)
 	dispatch->base.dispatch_type = DISPATCH_FALLBACK;
 	dispatch->base.interface = &fallback_interface;
 	dispatch->pending_event = EVDEV_NONE;
+	list_init(&dispatch->lid.paired_keyboard_list);
 
 	fallback_dispatch_init_rel(dispatch, device);
 	fallback_dispatch_init_abs(dispatch, device);
