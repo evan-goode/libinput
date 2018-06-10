@@ -2511,9 +2511,9 @@ tp_init_accel(struct tp_dispatch *tp)
 	    tp->device->model_flags & EVDEV_MODEL_LENOVO_X220_TOUCHPAD_FW81)
 		filter = create_pointer_accelerator_filter_lenovo_x230(tp->device->dpi);
 	else if (libevdev_get_id_bustype(device->evdev) == BUS_BLUETOOTH)
-		filter = create_pointer_accelerator_filter_touchpad(device->dpi, ms2us(50), ms2us(10));
+		filter = create_pointer_accelerator_filter_flat(device->dpi);
 	else
-		filter = create_pointer_accelerator_filter_touchpad(device->dpi, 0, 0);
+		filter = create_pointer_accelerator_filter_flat(device->dpi);
 
 	if (!filter)
 		return false;
