@@ -140,6 +140,15 @@ class TestYaml(unittest.TestCase):
             properties = evdev['properties']
             self.assertTrue(isinstance(properties, list))
 
+    def test_hid(self):
+        devices = self.yaml['devices']
+        for d in devices:
+            hid = d['hid']
+            self.assertTrue(isinstance(hid, list))
+            for byte in hid:
+                self.assertGreaterEqual(byte, 0)
+                self.assertLessEqual(byte, 255)
+
     def test_udev_sections_exist(self):
         sections = ['properties']
         devices = self.yaml['devices']
@@ -377,6 +386,7 @@ class TestYaml(unittest.TestCase):
                         self.assertFalse(need_frame)
                         continue
 
+                    if t == 'TOUCH_FRAME':
                         self.assertTrue(need_frame)
                         need_frame = False
                     else:

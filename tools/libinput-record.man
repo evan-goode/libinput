@@ -38,10 +38,10 @@ seconds of device inactivity. This option requires that a
 suffixed with the date and time of the recording. The timeout must be
 greater than 0.
 .TP 8
-.B \-o filename
+.B \-o filename.yml
 .PD 0
 .TP 8
-.B \-\-output-file=filename
+.B \-\-output-file=filename.yml
 .PD 1
 Specifies the output file to use. If \fB\-\-autorestart\fR or
 \fB\-\-multiple\fR is given, the filename is used as prefix only.
@@ -52,6 +52,10 @@ Record multiple devices at once, see section
 This option requires that a
 \fB\-\-output-file\fR is specified and that all devices to be recorded are
 given on the commandline.
+.TP 8
+.B \-\-show\-keycodes
+Show keycodes as-is in the recording. By default, common keys are obfuscated
+and printed as \fBKEY_A\fR to avoid information leaks.
 .TP 8
 .B \-\-with-libinput
 Record libinput events alongside device events.
@@ -145,10 +149,14 @@ devices:
         57: [0, 65535, 0, 0, 0]
         58: [0, 255, 0, 0, 0]
       properties: [0, 2, 4]
+    hid: [12, 23, 34, 45, ...]
     udev:
       properties:
       - ID_INPUT_MOUSE=1
       - ID_INPUT=1
+    quirks:
+      - ModelAppleTouchpad=1
+      - AttrSizeHint=32x32
     events:
       - evdev:
         - [  0,      0,   3,  57,  1420] # EV_ABS / ABS_MT_TRACKING_ID   1420
@@ -222,6 +230,9 @@ the device node recorded
 .B evdev
 A dictionary with the evdev device information.
 .TP 8
+.B hid
+A list of integers representing the HID report descriptor bytes.
+.TP 8
 .B udev
 A dictionary with the udev device information.
 .TP 8
@@ -253,6 +264,9 @@ A list of udev properties in the \fBkey=value\fR format. This is not the
 complete list of properties assigned to the device but a subset that is
 relevant to libinput. These properties may include properties set on a
 parent device.
+.TP 8
+.B quirks: list of strings
+A list of device quirks the \fBkey=value\fR format.
 
 .SS events
 A list of the recorded events. The list contains dictionaries

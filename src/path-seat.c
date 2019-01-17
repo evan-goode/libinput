@@ -308,9 +308,6 @@ udev_device_from_devnode(struct libinput *libinput,
 
 	while (dev && !udev_device_get_is_initialized(dev)) {
 		udev_device_unref(dev);
-		msleep(10);
-		dev = udev_device_new_from_devnum(udev, 'c', st.st_rdev);
-
 		count++;
 		if (count > 200) {
 			log_bug_libinput(libinput,
@@ -318,6 +315,8 @@ udev_device_from_devnode(struct libinput *libinput,
 					devnode);
 			return NULL;
 		}
+		msleep(10);
+		dev = udev_device_new_from_devnum(udev, 'c', st.st_rdev);
 	}
 
 	return dev;
@@ -336,6 +335,13 @@ libinput_path_add_device(struct libinput *libinput,
 		log_bug_client(libinput, "Mismatching backends.\n");
 		return NULL;
 	}
+
+	/* We cannot do this during path_create_context because the log
+	 * handler isn't set up there but we really want to log to the right
+	 * place if the quirks run into parser errors. So we have to do it
+	 * on the first call to add_device.
+	 */
+	libinput_init_quirks(libinput);
 
 	udev_device = udev_device_from_devnode(libinput, udev, path);
 	if (!udev_device) {

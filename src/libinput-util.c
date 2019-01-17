@@ -36,6 +36,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <libevdev/libevdev.h>
 
 #include "libinput-util.h"
 #include "libinput-private.h"
@@ -59,6 +60,20 @@ list_insert(struct list *list, struct list *elm)
 	elm->next = list->next;
 	list->next = elm;
 	elm->next->prev = elm;
+}
+
+void
+list_append(struct list *list, struct list *elm)
+{
+	assert((list->next != NULL && list->prev != NULL) ||
+	       !"list->next|prev is NULL, possibly missing list_init()");
+	assert(((elm->next == NULL && elm->prev == NULL) || list_empty(elm)) ||
+	       !"elm->next|prev is not NULL, list node used twice?");
+
+	elm->next = list;
+	elm->prev = list->prev;
+	list->prev = elm;
+	elm->prev->next = elm;
 }
 
 void
@@ -238,28 +253,6 @@ parse_mouse_wheel_click_angle_property(const char *prop)
 }
 
 /**
- * Helper function to parse the TRACKPOINT_CONST_ACCEL property from udev.
- * Property is of the form:
- * TRACKPOINT_CONST_ACCEL=<float>
- *
- * @param prop The value of the udev property (without the TRACKPOINT_CONST_ACCEL=)
- * @return The acceleration, or 0.0 on error.
- */
-double
-parse_trackpoint_accel_property(const char *prop)
-{
-	double accel;
-
-	if (!prop)
-		return 0.0;
-
-	if (!safe_atod(prop, &accel))
-		accel = 0.0;
-
-	return accel;
-}
-
-/**
  * Parses a simple dimension string in the form of "10x40". The two
  * numbers must be positive integers in decimal notation.
  * On success, the two numbers are stored in w and h. On failure, w and h
@@ -281,7 +274,7 @@ parse_dimension_property(const char *prop, size_t *w, size_t *h)
 	if (sscanf(prop, "%dx%d", &x, &y) != 2)
 		return false;
 
-	if (x < 0 || y < 0)
+	if (x <= 0 || y <= 0)
 		return false;
 
 	*w = (size_t)x;
@@ -406,79 +399,123 @@ parse_range_property(const char *prop, int *hi, int *lo)
 	return true;
 }
 
-/**
- * Helper function to parse the LIBINPUT_ATTR_PALM_PRESSURE_THRESHOLD
- * property from udev. Property is of the form:
- * LIBINPUT_ATTR_PALM_PRESSURE_THRESHOLD=<integer>
- * Where the number indicates the minimum threshold to consider a touch to
- * be a palm.
- *
- * @param prop The value of the udev property (without the *
- * LIBINPUT_ATTR_PALM_PRESSURE_THRESHOLD=)
- * @return The pressure threshold or 0 on error
- */
-int
-parse_palm_pressure_property(const char *prop)
+static bool
+parse_evcode_string(const char *s, int *type_out, int *code_out)
 {
-	int threshold = 0;
+	int type, code;
 
-	if (!prop)
-		return 0;
+	if (strneq(s, "EV_", 3)) {
+		type = libevdev_event_type_from_name(s);
+		if (type == -1)
+			return false;
 
-	if (!safe_atoi(prop, &threshold) || threshold < 0)
-		return 0;
+		code = EVENT_CODE_UNDEFINED;
+	} else {
+		struct map {
+			const char *str;
+			int type;
+		} map[] = {
+			{ "KEY_", EV_KEY },
+			{ "BTN_", EV_KEY },
+			{ "ABS_", EV_ABS },
+			{ "REL_", EV_REL },
+			{ "SW_", EV_SW },
+		};
+		struct map *m;
+		bool found = false;
 
-        return threshold;
+		ARRAY_FOR_EACH(map, m) {
+			if (!strneq(s, m->str, strlen(m->str)))
+				continue;
+
+			type = m->type;
+			code = libevdev_event_code_from_name(type, s);
+			if (code == -1)
+				return false;
+
+			found = true;
+			break;
+		}
+		if (!found)
+			return false;
+	}
+
+	*type_out = type;
+	*code_out = code;
+
+	return true;
 }
 
 /**
- * Helper function to parse the LIBINPUT_ATTR_PALM_SIZE_THRESHOLD property
- * from udev. Property is of the form:
- * LIBINPUT_ATTR_PALM_SIZE_THRESHOLD=<integer>
- * Where the number indicates the minimum threshold to consider a touch to
- * be a palm.
+ * Parses a string of the format "EV_ABS;KEY_A;BTN_TOOL_DOUBLETAP;ABS_X;"
+ * where each element must be a named event type OR a named event code OR a
+ * tuple in the form of EV_KEY:0x123, i.e. a named event type followed by a
+ * hex event code.
  *
- * @param prop The value of the udev property (without the
- * LIBINPUT_ATTR_PALM_SIZE_THRESHOLD=)
- * @return The pressure threshold or 0 on error
- */
-int
-parse_palm_size_property(const char *prop)
-{
-	int thr = 0;
-
-	if (!prop)
-		return 0;
-
-	if (!safe_atoi(prop, &thr) || thr < 0 || thr > 2028)
-		return 0;
-
-        return thr;
-}
-
-/**
- * Helper function to parse the LIBINPUT_ATTR_THUMB_PRESSURE_THRESHOLD
- * property from udev. Property is of the form:
- * LIBINPUT_ATTR_THUMB_PRESSURE_THRESHOLD=<integer>
- * Where the number indicates the minimum threshold to consider a touch to
- * be a thumb.
+ * events must point to an existing array of size nevents.
+ * nevents specifies the size of the array in events and returns the number
+ * of items, elements exceeding nevents are simply ignored, just make sure
+ * events is large enough for your use-case.
  *
- * @param prop The value of the udev property (without the
- * LIBINPUT_ATTR_THUMB_PRESSURE_THRESHOLD=)
- * @return The pressure threshold or 0 on error
+ * The results are returned as input events with type and code set, all
+ * other fields undefined. Where only the event type is specified, the code
+ * is set to EVENT_CODE_UNDEFINED.
+ *
+ * On success, events contains nevents events.
  */
-int
-parse_thumb_pressure_property(const char *prop)
+bool
+parse_evcode_property(const char *prop, struct input_event *events, size_t *nevents)
 {
-	int threshold = 0;
+	char **strv = NULL;
+	bool rc = false;
+	size_t ncodes = 0;
+	size_t idx;
+	struct input_event evs[*nevents];
 
-	if (!prop)
-		return 0;
+	memset(evs, 0, sizeof evs);
 
-	if (!safe_atoi(prop, &threshold) || threshold < 0)
-		return 0;
+	strv = strv_from_string(prop, ";");
+	if (!strv)
+		goto out;
 
-        return threshold;
+	for (idx = 0; strv[idx]; idx++)
+		ncodes++;
+
+	/* A randomly chosen max so we avoid crazy quirks */
+	if (ncodes == 0 || ncodes > 32)
+		goto out;
+
+	ncodes = min(*nevents, ncodes);
+	for (idx = 0; strv[idx]; idx++) {
+		char *s = strv[idx];
+
+		int type, code;
+
+		if (strstr(s, ":") == NULL) {
+			if (!parse_evcode_string(s, &type, &code))
+				goto out;
+		} else {
+			int consumed;
+			char stype[13] = {0}; /* EV_FF_STATUS + '\0' */
+
+			if (sscanf(s, "%12[A-Z_]:%x%n", stype, &code, &consumed) != 2 ||
+			    strlen(s) != (size_t)consumed ||
+			    (type = libevdev_event_type_from_name(stype)) == -1 ||
+			    code < 0 || code > libevdev_event_type_get_max(type))
+			    goto out;
+		}
+
+		evs[idx].type = type;
+		evs[idx].code = code;
+	}
+
+	memcpy(events, evs, ncodes * sizeof *events);
+	*nevents = ncodes;
+	rc = true;
+
+out:
+	strv_free(strv);
+	return rc;
 }
 
 /**
@@ -586,11 +623,17 @@ strv_join(char **strv, const char *joiner)
 	if (!strv || !joiner)
 		return NULL;
 
+	if (strv[0] == NULL)
+		return NULL;
+
 	for (s = strv, count = 0; *s; s++, count++) {
 		slen += strlen(*s);
 	}
 
 	assert(slen < 1000);
+	assert(strlen(joiner) < 1000);
+	assert(count > 0);
+	assert(count < 100);
 
 	slen += (count - 1) * strlen(joiner);
 

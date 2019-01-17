@@ -37,6 +37,8 @@
 
 #include <gtk/gtk.h>
 #include <glib.h>
+#include <glib-unix.h>
+#include <libevdev/libevdev.h>
 
 #include <libinput.h>
 #include <libinput-util.h>
@@ -54,8 +56,18 @@ struct point {
 	double x, y;
 };
 
+struct evdev_device {
+	struct list node;
+	struct libevdev *evdev;
+	struct libinput_device *libinput_device;
+	int fd;
+	guint source_id;
+};
+
 struct window {
+	bool grab;
 	struct tools_options options;
+	struct list evdev_devices;
 
 	GtkWidget *win;
 	GtkWidget *area;
@@ -63,6 +75,11 @@ struct window {
 
 	/* sprite position */
 	double x, y;
+
+	/* these are for the delta coordinates, but they're not
+	 * deltas, they are converted into abs positions */
+	size_t ndeltas;
+	struct point deltas[64];
 
 	/* abs position */
 	int absx, absy;
@@ -105,6 +122,18 @@ struct window {
 		struct point deltas[64];
 	} tool;
 
+	struct {
+		int rel_x, rel_y; /* REL_X/Y */
+		int x, y;	  /* ABS_X/Y */
+		struct {
+			int x, y; /* ABS_MT_POSITION_X/Y */
+			bool active;
+		} slots[16];
+		unsigned int slot; /* ABS_MT_SLOT */
+		/* So we know when to re-fetch the abs axes */
+		uintptr_t device, last_device;
+	} evdev;
+
 	struct libinput_device *devices[50];
 };
 
@@ -118,6 +147,128 @@ msg(const char *fmt, ...)
 	va_start(args, fmt);
 	vprintf(fmt, args);
 	va_end(args);
+}
+
+static inline void
+draw_evdev_rel(struct window *w, cairo_t *cr)
+{
+	int center_x, center_y;
+
+	cairo_save(cr);
+	cairo_set_source_rgb(cr, .2, .2, .8);
+	center_x = w->width/2 - 400;
+	center_y = w->height/2;
+
+	cairo_arc(cr, center_x, center_y, 10, 0, 2 * M_PI);
+	cairo_stroke(cr);
+
+	if (w->evdev.rel_x) {
+		int dir = w->evdev.rel_x > 0 ? 1 : -1;
+		for (int i = 0; i < abs(w->evdev.rel_x); i++) {
+			cairo_move_to(cr,
+				      center_x + (i + 1) * 20 * dir,
+				      center_y - 20);
+			cairo_rel_line_to(cr, 0, 40);
+			cairo_rel_line_to(cr, 20 * dir, -20);
+			cairo_rel_line_to(cr, -20 * dir, -20);
+			cairo_fill(cr);
+		}
+        }
+
+	if (w->evdev.rel_y) {
+		int dir = w->evdev.rel_y > 0 ? 1 : -1;
+		for (int i = 0; i < abs(w->evdev.rel_y); i++) {
+			cairo_move_to(cr,
+				      center_x - 20,
+				      center_y + (i + 1) * 20 * dir);
+			cairo_rel_line_to(cr, 40, 0);
+			cairo_rel_line_to(cr, -20, 20 * dir);
+			cairo_rel_line_to(cr, -20, -20 * dir);
+			cairo_fill(cr);
+		}
+        }
+
+	cairo_restore(cr);
+}
+
+static inline void
+draw_evdev_abs(struct window *w, cairo_t *cr)
+{
+	static const struct input_absinfo *ax = NULL, *ay = NULL;
+	const int normalized_width = 200;
+	int outline_width = normalized_width,
+	    outline_height = normalized_width * 0.75;
+	int center_x, center_y;
+	int width, height;
+	int x, y;
+
+	cairo_save(cr);
+	cairo_set_source_rgb(cr, .2, .2, .8);
+
+	center_x = w->width/2 + 400;
+	center_y = w->height/2;
+
+	/* Always the outline even if we didn't get any abs events yet so it
+	 * doesn't just appear out of nowhere */
+	if (w->evdev.device == 0)
+		goto draw_outline;
+
+	/* device has changed, so the abs proportions/dimensions have
+	 * changed. */
+	if (w->evdev.device != w->evdev.last_device) {
+		struct evdev_device *d;
+
+		ax = NULL;
+		ay = NULL;
+
+		list_for_each(d, &w->evdev_devices, node) {
+			if ((uintptr_t)d->libinput_device != w->evdev.device)
+				continue;
+
+			ax = libevdev_get_abs_info(d->evdev, ABS_X);
+			ay = libevdev_get_abs_info(d->evdev, ABS_Y);
+			w->evdev.last_device = w->evdev.device;
+		}
+
+	}
+	if (ax == NULL || ay == NULL)
+		goto draw_outline;
+
+	width = ax->maximum - ax->minimum;
+	height = ay->maximum - ay->minimum;
+	outline_height = 1.0 * height/width * normalized_width;
+	outline_width = normalized_width;
+
+	x = 1.0 * (w->evdev.x - ax->minimum)/width * outline_width;
+	y = 1.0 * (w->evdev.y - ay->minimum)/height * outline_height;
+	x += center_x - outline_width/2;
+	y += center_y - outline_height/2;
+	cairo_arc(cr, x, y, 10, 0, 2 * M_PI);
+	cairo_fill(cr);
+
+	for (size_t i = 0; i < ARRAY_LENGTH(w->evdev.slots); i++) {
+		if (!w->evdev.slots[i].active)
+			continue;
+
+		x = w->evdev.slots[i].x;
+		y = w->evdev.slots[i].y;
+		x = 1.0 * (x - ax->minimum)/width * outline_width;
+		y = 1.0 * (y - ay->minimum)/height * outline_height;
+		x += center_x - outline_width/2;
+		y += center_y - outline_height/2;
+		cairo_arc(cr, x, y, 10, 0, 2 * M_PI);
+		cairo_fill(cr);
+	}
+
+draw_outline:
+	/* The touchpad outline */
+	cairo_rectangle(cr,
+			center_x - outline_width/2,
+			center_y - outline_height/2,
+			outline_width,
+			outline_height);
+	cairo_stroke(cr);
+	cairo_restore(cr);
 }
 
 static inline void
@@ -268,6 +419,26 @@ draw_tablet(struct window *w, cairo_t *cr)
 	cairo_fill(cr);
 	cairo_restore(cr);
 
+	/* pointer deltas */
+	mask = ARRAY_LENGTH(w->deltas);
+	first = max(w->ndeltas + 1, mask) - mask;
+	last = w->ndeltas;
+
+	cairo_save(cr);
+	cairo_set_source_rgb(cr, .8, .5, .2);
+
+	x = w->deltas[first % mask].x;
+	y = w->deltas[first % mask].y;
+	cairo_move_to(cr, x, y);
+
+	for (i = first + 1; i < last; i++) {
+		x = w->deltas[i % mask].x;
+		y = w->deltas[i % mask].y;
+		cairo_line_to(cr, x, y);
+	}
+
+	cairo_stroke(cr);
+
 	/* tablet deltas */
 	mask = ARRAY_LENGTH(w->tool.deltas);
 	first = max(w->tool.ndeltas + 1, mask) - mask;
@@ -369,6 +540,8 @@ draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 	cairo_fill(cr);
 
 	draw_background(w, cr);
+	draw_evdev_rel(w, cr);
+	draw_evdev_abs(w, cr);
 
 	draw_gestures(w, cr);
 	draw_scrollbars(w, cr);
@@ -430,7 +603,7 @@ map_event_cb(GtkWidget *widget, GdkEvent *event, gpointer data)
 static void
 window_init(struct window *w)
 {
-	memset(w, 0, sizeof(*w));
+	list_init(&w->evdev_devices);
 
 	w->win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
 	gtk_widget_set_events(w->win, 0);
@@ -492,6 +665,146 @@ change_ptraccel(struct window *w, double amount)
 	}
 }
 
+static int
+handle_event_evdev(GIOChannel *source, GIOCondition condition, gpointer data)
+{
+	struct libinput_device *dev = data;
+	struct libinput *li = libinput_device_get_context(dev);
+	struct window *w = libinput_get_user_data(li);
+	struct evdev_device *d,
+			    *device = NULL;
+	struct input_event e;
+	int rc;
+
+	list_for_each(d, &w->evdev_devices, node) {
+		if (d->libinput_device == dev) {
+			device = d;
+			break;
+		}
+	}
+
+	if (device == NULL) {
+		msg("Unknown device: %s\n", libinput_device_get_name(dev));
+		return FALSE;
+	}
+
+	do {
+		rc = libevdev_next_event(device->evdev,
+					 LIBEVDEV_READ_FLAG_NORMAL,
+					 &e);
+		if (rc == -EAGAIN) {
+			break;
+		} else if (rc == LIBEVDEV_READ_STATUS_SYNC) {
+			msg("SYN_DROPPED received\n");
+			goto out;
+		} else if (rc != LIBEVDEV_READ_STATUS_SUCCESS) {
+			msg("Error reading event: %s\n", strerror(-rc));
+			goto out;
+		}
+
+#define EVENT(t_, c_) (t_ << 16 | c_)
+		switch (EVENT(e.type, e.code)) {
+		case EVENT(EV_REL, REL_X):
+			w->evdev.rel_x = e.value;
+			break;
+		case EVENT(EV_REL, REL_Y):
+			w->evdev.rel_y = e.value;
+			break;
+		case EVENT(EV_ABS, ABS_MT_SLOT):
+			w->evdev.slot = min((unsigned int)e.value,
+					  ARRAY_LENGTH(w->evdev.slots) - 1);
+			w->evdev.device = (uintptr_t)dev;
+			break;
+		case EVENT(EV_ABS, ABS_MT_TRACKING_ID):
+			w->evdev.slots[w->evdev.slot].active = (e.value != -1);
+			w->evdev.device = (uintptr_t)dev;
+			break;
+		case EVENT(EV_ABS, ABS_X):
+			w->evdev.x = e.value;
+			w->evdev.device = (uintptr_t)dev;
+			break;
+		case EVENT(EV_ABS, ABS_Y):
+			w->evdev.y = e.value;
+			w->evdev.device = (uintptr_t)dev;
+			break;
+		case EVENT(EV_ABS, ABS_MT_POSITION_X):
+			w->evdev.slots[w->evdev.slot].x = e.value;
+			w->evdev.device = (uintptr_t)dev;
+			break;
+		case EVENT(EV_ABS, ABS_MT_POSITION_Y):
+			w->evdev.slots[w->evdev.slot].y = e.value;
+			w->evdev.device = (uintptr_t)dev;
+			break;
+		}
+	} while (rc == LIBEVDEV_READ_STATUS_SUCCESS);
+
+	gtk_widget_queue_draw(w->area);
+out:
+	return TRUE;
+}
+
+static void
+register_evdev_device(struct window *w, struct libinput_device *dev)
+{
+	GIOChannel *c;
+	struct udev_device *ud;
+	struct libevdev *evdev;
+	const char *device_node;
+	int fd;
+	struct evdev_device *d;
+
+	ud = libinput_device_get_udev_device(dev);
+	device_node = udev_device_get_devnode(ud);
+
+	fd = open(device_node, O_RDONLY|O_NONBLOCK);
+	if (fd == -1) {
+		msg("failed to open %s, evdev events unavailable\n", device_node);
+		goto out;
+	}
+
+	if (libevdev_new_from_fd(fd, &evdev) != 0) {
+		msg("failed to create context for %s, evdev events unavailable\n",
+		    device_node);
+		goto out;
+	}
+
+	d = zalloc(sizeof *d);
+	list_append(&w->evdev_devices, &d->node);
+	d->fd = fd;
+	d->evdev = evdev;
+	d->libinput_device =libinput_device_ref(dev);
+
+	c = g_io_channel_unix_new(fd);
+	g_io_channel_set_encoding(c, NULL, NULL);
+	d->source_id = g_io_add_watch(c, G_IO_IN,
+				      handle_event_evdev,
+				      d->libinput_device);
+	fd = -1;
+out:
+	close(fd);
+	udev_device_unref(ud);
+}
+
+static void
+unregister_evdev_device(struct window *w, struct libinput_device *dev)
+{
+	struct evdev_device *d;
+
+	list_for_each(d, &w->evdev_devices, node) {
+		if (d->libinput_device != dev)
+			continue;
+
+		list_remove(&d->node);
+		g_source_remove(d->source_id);
+		libinput_device_unref(d->libinput_device);
+		libevdev_free(d->evdev);
+		close(d->fd);
+		free(d);
+		w->evdev.last_device = 0;
+		break;
+	}
+}
+
 static void
 handle_event_device_notify(struct libinput_event *ev)
 {
@@ -501,21 +814,23 @@ handle_event_device_notify(struct libinput_event *ev)
 	const char *type;
 	size_t i;
 
-	if (libinput_event_get_type(ev) == LIBINPUT_EVENT_DEVICE_ADDED)
+	li = libinput_event_get_context(ev);
+	w = libinput_get_user_data(li);
+
+	if (libinput_event_get_type(ev) == LIBINPUT_EVENT_DEVICE_ADDED) {
 		type = "added";
-	else
+		register_evdev_device(w, dev);
+		tools_device_apply_config(libinput_event_get_device(ev),
+					  &w->options);
+	} else {
 		type = "removed";
+		unregister_evdev_device(w, dev);
+	}
 
 	msg("%s %-30s %s\n",
 	    libinput_device_get_sysname(dev),
 	    libinput_device_get_name(dev),
 	    type);
-
-	li = libinput_event_get_context(ev);
-	w = libinput_get_user_data(li);
-
-	tools_device_apply_config(libinput_event_get_device(ev),
-				  &w->options);
 
 	if (libinput_event_get_type(ev) == LIBINPUT_EVENT_DEVICE_ADDED) {
 		for (i = 0; i < ARRAY_LENGTH(w->devices); i++) {
@@ -541,11 +856,22 @@ handle_event_motion(struct libinput_event *ev, struct window *w)
 	struct libinput_event_pointer *p = libinput_event_get_pointer_event(ev);
 	double dx = libinput_event_pointer_get_dx(p),
 	       dy = libinput_event_pointer_get_dy(p);
+	struct point point;
+	const int mask = ARRAY_LENGTH(w->deltas);
+	size_t idx;
 
 	w->x += dx;
 	w->y += dy;
 	w->x = clip(w->x, 0.0, w->width);
 	w->y = clip(w->y, 0.0, w->height);
+
+	idx = w->ndeltas % mask;
+	point = w->deltas[idx];
+	idx = (w->ndeltas + 1) % mask;
+	point.x += libinput_event_pointer_get_dx_unaccelerated(p);
+	point.y += libinput_event_pointer_get_dy_unaccelerated(p);
+	w->deltas[idx] = point;
+	w->ndeltas++;
 }
 
 static void
@@ -880,21 +1206,30 @@ sockets_init(struct libinput *li)
 
 static void
 usage(void) {
-	printf("Usage: libinput debug-gui [options] [--udev <seat>|--device /dev/input/event0]\n");
+	printf("Usage: libinput debug-gui [options] [--udev <seat>|[--device] /dev/input/event0]\n");
+}
+
+static gboolean
+signal_handler(void *data)
+{
+	gtk_main_quit();
+
+	return FALSE;
 }
 
 int
 main(int argc, char **argv)
 {
-	struct window w;
+	struct window w = {0};
 	struct tools_options options;
 	struct libinput *li;
-	enum tools_backend backend = BACKEND_UDEV;
+	enum tools_backend backend = BACKEND_NONE;
 	const char *seat_or_device = "seat0";
-	bool grab = false;
 	bool verbose = false;
 
 	gtk_init(&argc, &argv);
+
+	g_unix_signal_add(SIGINT, signal_handler, NULL);
 
 	tools_init_options(&options);
 
@@ -923,7 +1258,7 @@ main(int argc, char **argv)
 
 		switch(c) {
 		case '?':
-			exit(1);
+			exit(EXIT_INVALID_USAGE);
 			break;
 		case 'h':
 			usage();
@@ -938,7 +1273,7 @@ main(int argc, char **argv)
 			seat_or_device = optarg;
 			break;
 		case OPT_GRAB:
-			grab = true;
+			w.grab = true;
 			break;
 		case OPT_VERBOSE:
 			verbose = true;
@@ -946,7 +1281,7 @@ main(int argc, char **argv)
 		default:
 			if (tools_parse_option(c, optarg, &options) != 0) {
 				usage();
-				return 1;
+				return EXIT_INVALID_USAGE;
 			}
 			break;
 		}
@@ -954,13 +1289,19 @@ main(int argc, char **argv)
 	}
 
 	if (optind < argc) {
-		usage();
-		return 1;
+		if (optind < argc - 1 || backend != BACKEND_NONE) {
+			usage();
+			return EXIT_INVALID_USAGE;
+		}
+		backend = BACKEND_DEVICE;
+		seat_or_device = argv[optind];
+	} else if (backend == BACKEND_NONE) {
+		backend = BACKEND_UDEV;
 	}
 
-	li = tools_open_backend(backend, seat_or_device, verbose, grab);
+	li = tools_open_backend(backend, seat_or_device, verbose, &w.grab);
 	if (!li)
-		return 1;
+		return EXIT_FAILURE;
 
 	libinput_set_user_data(li, &w);
 
@@ -974,5 +1315,5 @@ main(int argc, char **argv)
 	window_cleanup(&w);
 	libinput_unref(li);
 
-	return 0;
+	return EXIT_SUCCESS;
 }

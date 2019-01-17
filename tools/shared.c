@@ -232,7 +232,7 @@ open_restricted(const char *path, int flags, void *user_data)
 	if (fd < 0)
 		fprintf(stderr, "Failed to open %s (%s)\n",
 			path, strerror(errno));
-	else if (*grab && ioctl(fd, EVIOCGRAB, (void*)1) == -1)
+	else if (grab && *grab && ioctl(fd, EVIOCGRAB, (void*)1) == -1)
 		fprintf(stderr, "Grab requested, but failed for %s (%s)\n",
 			path, strerror(errno));
 
@@ -251,7 +251,7 @@ static const struct libinput_interface interface = {
 };
 
 static struct libinput *
-tools_open_udev(const char *seat, bool verbose, bool grab)
+tools_open_udev(const char *seat, bool verbose, bool *grab)
 {
 	struct libinput *li;
 	struct udev *udev = udev_new();
@@ -261,16 +261,15 @@ tools_open_udev(const char *seat, bool verbose, bool grab)
 		return NULL;
 	}
 
-	li = libinput_udev_create_context(&interface, &grab, udev);
+	li = libinput_udev_create_context(&interface, grab, udev);
 	if (!li) {
 		fprintf(stderr, "Failed to initialize context from udev\n");
 		goto out;
 	}
 
-	if (verbose) {
-		libinput_log_set_handler(li, log_handler);
+	libinput_log_set_handler(li, log_handler);
+	if (verbose)
 		libinput_log_set_priority(li, LIBINPUT_LOG_PRIORITY_DEBUG);
-	}
 
 	if (libinput_udev_assign_seat(li, seat)) {
 		fprintf(stderr, "Failed to set seat\n");
@@ -285,12 +284,12 @@ out:
 }
 
 static struct libinput *
-tools_open_device(const char *path, bool verbose, bool grab)
+tools_open_device(const char *path, bool verbose, bool *grab)
 {
 	struct libinput_device *device;
 	struct libinput *li;
 
-	li = libinput_path_create_context(&interface, &grab);
+	li = libinput_path_create_context(&interface, grab);
 	if (!li) {
 		fprintf(stderr, "Failed to initialize context from %s\n", path);
 		return NULL;
@@ -311,13 +310,22 @@ tools_open_device(const char *path, bool verbose, bool grab)
 	return li;
 }
 
+static void
+tools_setenv_quirks_dir(void)
+{
+	if (tools_execdir_is_builddir(NULL, 0))
+		setenv("LIBINPUT_QUIRKS_DIR", LIBINPUT_QUIRKS_SRCDIR, 0);
+}
+
 struct libinput *
 tools_open_backend(enum tools_backend which,
 		   const char *seat_or_device,
 		   bool verbose,
-		   bool grab)
+		   bool *grab)
 {
 	struct libinput *li;
+
+	tools_setenv_quirks_dir();
 
 	switch (which) {
 	case BACKEND_UDEV:
@@ -467,16 +475,68 @@ out:
 	return is_touchpad;
 }
 
+/**
+ * Try to read the directory we're executing from and if it matches the
+ * builddir, return it.
+ *
+ * @param execdir_out If not NULL, set to the exec directory
+ * @param sz Size of execdir_out
+ *
+ * @return true if the execdir is the builddir, false otherwise.
+ *
+ * If execdir_out is NULL and szt is 0, it merely returns true/false.
+ */
+bool
+tools_execdir_is_builddir(char *execdir_out, size_t sz)
+{
+	char execdir[PATH_MAX] = {0};
+	char *pathsep;
+	ssize_t nread;
+
+	/* In the case of release builds, the builddir is
+	   the empty string */
+	if (streq(MESON_BUILD_ROOT, ""))
+		return false;
+
+	nread = readlink("/proc/self/exe", execdir, sizeof(execdir) - 1);
+	if (nread <= 0 || nread == sizeof(execdir) - 1)
+		return false;
+
+	/* readlink doesn't terminate the string and readlink says
+	   anything past sz is undefined */
+	execdir[++nread] = '\0';
+
+	pathsep = strrchr(execdir, '/');
+	if (!pathsep)
+		return false;
+
+	*pathsep = '\0';
+	if (!streq(execdir, MESON_BUILD_ROOT))
+		return false;
+
+	if (sz > 0) {
+		assert(execdir_out != NULL);
+		assert(sz >= (size_t)nread);
+		snprintf(execdir_out, nread, "%s", execdir);
+	}
+	return true;
+}
+
 static inline void
 setup_path(void)
 {
 	const char *path = getenv("PATH");
 	char new_path[PATH_MAX];
+	char builddir[PATH_MAX];
+	const char *extra_path = LIBINPUT_TOOL_PATH;
+
+	if (tools_execdir_is_builddir(builddir, sizeof(builddir)))
+		extra_path = builddir;
 
 	snprintf(new_path,
 		 sizeof(new_path),
 		 "%s:%s",
-		 LIBINPUT_TOOL_PATH,
+		 extra_path,
 		 path ? path : "");
 	setenv("PATH", new_path, 1);
 }
@@ -516,7 +576,7 @@ tools_exec_command(const char *prefix, int real_argc, char **real_argv)
 				"libinput: %s is not a libinput command or not installed. "
 				"See 'libinput --help'\n",
 				command);
-
+			return EXIT_INVALID_USAGE;
 		} else {
 			fprintf(stderr,
 				"Failed to execute '%s' (%s)\n",
@@ -526,4 +586,119 @@ tools_exec_command(const char *prefix, int real_argc, char **real_argv)
 	}
 
 	return EXIT_FAILURE;
+}
+
+static void
+sprintf_event_codes(char *buf, size_t sz, struct quirks *quirks)
+{
+	const struct quirk_tuples *t;
+	size_t off = 0;
+	int printed;
+	const char *name;
+
+	quirks_get_tuples(quirks, QUIRK_ATTR_EVENT_CODE_DISABLE, &t);
+	name = quirk_get_name(QUIRK_ATTR_EVENT_CODE_DISABLE);
+	printed = snprintf(buf, sz, "%s=", name);
+	assert(printed != -1);
+	off += printed;
+
+	for (size_t i = 0; off < sz && i < t->ntuples; i++) {
+		const char *name = libevdev_event_code_get_name(
+						t->tuples[i].first,
+						t->tuples[i].second);
+
+		printed = snprintf(buf + off, sz - off, "%s;", name);
+		assert(printed != -1);
+		off += printed;
+	}
+}
+
+void
+tools_list_device_quirks(struct quirks_context *ctx,
+			 struct udev_device *device,
+			 void (*callback)(void *data, const char *str),
+			 void *userdata)
+{
+	char buf[256];
+
+	struct quirks *quirks;
+	enum quirk q;
+
+	quirks = quirks_fetch_for_device(ctx, device);
+	if (!quirks)
+		return;
+
+	q = QUIRK_MODEL_ALPS_TOUCHPAD;
+	do {
+		if (quirks_has_quirk(quirks, q)) {
+			const char *name;
+
+			name = quirk_get_name(q);
+			snprintf(buf, sizeof(buf), "%s=1", name);
+			callback(userdata, buf);
+		}
+	} while(++q < _QUIRK_LAST_MODEL_QUIRK_);
+
+	q = QUIRK_ATTR_SIZE_HINT;
+	do {
+		if (quirks_has_quirk(quirks, q)) {
+			const char *name;
+			struct quirk_dimensions dim;
+			struct quirk_range r;
+			uint32_t v;
+			char *s;
+			double d;
+
+			name = quirk_get_name(q);
+
+			switch (q) {
+			case QUIRK_ATTR_SIZE_HINT:
+			case QUIRK_ATTR_RESOLUTION_HINT:
+				quirks_get_dimensions(quirks, q, &dim);
+				snprintf(buf, sizeof(buf), "%s=%zdx%zd", name, dim.x, dim.y);
+				callback(userdata, buf);
+				break;
+			case QUIRK_ATTR_TOUCH_SIZE_RANGE:
+			case QUIRK_ATTR_PRESSURE_RANGE:
+				quirks_get_range(quirks, q, &r);
+				snprintf(buf, sizeof(buf), "%s=%d:%d", name, r.upper, r.lower);
+				callback(userdata, buf);
+				break;
+			case QUIRK_ATTR_PALM_SIZE_THRESHOLD:
+			case QUIRK_ATTR_PALM_PRESSURE_THRESHOLD:
+			case QUIRK_ATTR_THUMB_PRESSURE_THRESHOLD:
+			case QUIRK_ATTR_THUMB_SIZE_THRESHOLD:
+				quirks_get_uint32(quirks, q, &v);
+				snprintf(buf, sizeof(buf), "%s=%u", name, v);
+				callback(userdata, buf);
+				break;
+			case QUIRK_ATTR_LID_SWITCH_RELIABILITY:
+			case QUIRK_ATTR_KEYBOARD_INTEGRATION:
+			case QUIRK_ATTR_TPKBCOMBO_LAYOUT:
+			case QUIRK_ATTR_MSC_TIMESTAMP:
+				quirks_get_string(quirks, q, &s);
+				snprintf(buf, sizeof(buf), "%s=%s", name, s);
+				callback(userdata, buf);
+				break;
+			case QUIRK_ATTR_TRACKPOINT_MULTIPLIER:
+				quirks_get_double(quirks, q, &d);
+				snprintf(buf, sizeof(buf), "%s=%0.2f", name, d);
+				callback(userdata, buf);
+				break;
+			case QUIRK_ATTR_USE_VELOCITY_AVERAGING:
+				snprintf(buf, sizeof(buf), "%s=1", name);
+				callback(userdata, buf);
+				break;
+			case QUIRK_ATTR_EVENT_CODE_DISABLE:
+				sprintf_event_codes(buf, sizeof(buf), quirks);
+				callback(userdata, buf);
+				break;
+			default:
+				abort();
+				break;
+			}
+		}
+	} while(++q < _QUIRK_LAST_ATTR_QUIRK_);
+
+	quirks_unref(quirks);
 }
