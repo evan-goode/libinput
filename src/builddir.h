@@ -1,5 +1,5 @@
 /*
- * Copyright © 2013 Red Hat, Inc.
+ * Copyright © 2019 Red Hat, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -21,54 +21,41 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#include "config.h"
+#include <config.h>
 
-#include "litest.h"
-#include "litest-int.h"
+#pragma once
 
-#define NAME "All event codes keyboard"
-
-static bool all_codes_create(struct litest_device *d);
-
-static struct input_id input_id = {
-	.bustype = 0x11,
-	.vendor = 0x1,
-	.product = 0x1,
-};
-
-TEST_DEVICE("keyboard-all-codes",
-	.type = LITEST_KEYBOARD_ALL_CODES,
-	.features = LITEST_KEYS,
-	.interface = NULL,
-	.create = all_codes_create,
-
-	.name = NAME,
-	.id = &input_id,
-	.events = NULL,
-	.absinfo = NULL,
-)
-
-static bool
-all_codes_create(struct litest_device *d)
+/**
+ * Try to figure out the directory we're executing from and if it matches
+ * the builddir, return that directory. Otherwise, return NULL.
+ */
+static inline char *
+builddir_lookup(void)
 {
-	int events[KEY_MAX * 2 + 2];
-	int code, idx;
+	char execdir[PATH_MAX] = {0};
+	char *pathsep;
+	ssize_t nread;
 
-	for (idx = 0, code = 0; code < KEY_MAX; code++) {
-		const char *name = libevdev_event_code_get_name(EV_KEY, code);
+	/* In the case of release builds, the builddir is
+	   the empty string */
+	if (streq(MESON_BUILD_ROOT, ""))
+		return NULL;
 
-		if (name && strneq(name, "BTN_", 4))
-			continue;
+	nread = readlink("/proc/self/exe", execdir, sizeof(execdir) - 1);
+	if (nread <= 0 || nread == sizeof(execdir) - 1)
+		return NULL;
 
-		events[idx++] = EV_KEY;
-		events[idx++] = code;
-	}
-	events[idx++] = -1;
-	events[idx++] = -1;
+	/* readlink doesn't terminate the string and readlink says
+	   anything past sz is undefined */
+	execdir[++nread] = '\0';
 
-	d->uinput = litest_create_uinput_device_from_description(NAME,
-								 &input_id,
-								 NULL,
-								 events);
-	return false;
+	pathsep = strrchr(execdir, '/');
+	if (!pathsep)
+		return NULL;
+
+	*pathsep = '\0';
+	if (!streq(execdir, MESON_BUILD_ROOT))
+		return NULL;
+
+	return safe_strdup(execdir);
 }

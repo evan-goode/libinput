@@ -39,7 +39,7 @@ static struct input_event proximity_in[] = {
 static struct input_event proximity_out[] = {
 	{ .type = EV_ABS, .code = ABS_X, .value = 0 },
 	{ .type = EV_ABS, .code = ABS_Y, .value = 0 },
-	{ .type = EV_MSC, .code = MSC_SERIAL, .value = 0 },
+	{ .type = EV_MSC, .code = MSC_SERIAL, .value = 297797542 },
 	{ .type = EV_KEY, .code = BTN_TOOL_PEN, .value = 0 },
 	{ .type = EV_SYN, .code = SYN_REPORT, .value = 0 },
 	{ .type = -1, .code = -1 },
@@ -100,7 +100,7 @@ static int events[] = {
 
 TEST_DEVICE("wacom-hid4800-tablet",
 	.type = LITEST_WACOM_HID4800_PEN,
-	.features = LITEST_TABLET,
+	.features = LITEST_TABLET | LITEST_HOVER,
 	.interface = &interface,
 
 	.name = "Wacom HID 4800 Pen",

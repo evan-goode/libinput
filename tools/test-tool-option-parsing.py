@@ -41,10 +41,14 @@ class TestLibinputTool(unittest.TestCase):
             args.insert(1, self.subtool)
 
         with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
-            time.sleep(0.1)
-            p.send_signal(2)
-            p.wait()
-            return p.returncode, p.stdout.read().decode('UTF-8'), p.stderr.read().decode('UTF-8')
+            try:
+                p.wait(0.7)
+            except subprocess.TimeoutExpired:
+                p.send_signal(3) # SIGQUIT
+            stdout, stderr = p.communicate(timeout=2)
+            if p.returncode == -3:
+                p.returncode = 0
+            return p.returncode, stdout.decode('UTF-8'), stderr.decode('UTF-8')
 
     def run_command_success(self, args):
         rc, stdout, stderr = self.run_command(args)
@@ -52,7 +56,7 @@ class TestLibinputTool(unittest.TestCase):
         # never get rc 2 (invalid usage)
         self.assertIn(rc, [0, 1])
 
-    def run_command_unrecognised_option(self, args):
+    def run_command_unrecognized_option(self, args):
         rc, stdout, stderr = self.run_command(args)
         self.assertEqual(rc, 2)
         self.assertTrue(stdout.startswith('Usage') or stdout == '')
@@ -64,7 +68,7 @@ class TestLibinputTool(unittest.TestCase):
         self.assertTrue(stdout.startswith('Usage') or stdout == '')
         self.assertIn('requires an argument', stderr)
 
-    def run_command_unrecognised_tool(self, args):
+    def run_command_unrecognized_tool(self, args):
         rc, stdout, stderr = self.run_command(args)
         self.assertEqual(rc, 2)
         self.assertTrue(stdout.startswith('Usage') or stdout == '')
@@ -87,16 +91,16 @@ class TestLibinputCommand(TestLibinputTool):
         self.assertEqual(stderr, '')
 
     def test_invalid_arguments(self):
-        self.run_command_unrecognised_option(['--banana'])
-        self.run_command_unrecognised_option(['--foo'])
-        self.run_command_unrecognised_option(['--quiet'])
-        self.run_command_unrecognised_option(['--verbose'])
-        self.run_command_unrecognised_option(['--quiet', 'foo'])
+        self.run_command_unrecognized_option(['--banana'])
+        self.run_command_unrecognized_option(['--foo'])
+        self.run_command_unrecognized_option(['--quiet'])
+        self.run_command_unrecognized_option(['--verbose'])
+        self.run_command_unrecognized_option(['--quiet', 'foo'])
 
     def test_invalid_tools(self):
-        self.run_command_unrecognised_tool(['foo'])
-        self.run_command_unrecognised_tool(['debug'])
-        self.run_command_unrecognised_tool(['foo', '--quiet'])
+        self.run_command_unrecognized_tool(['foo'])
+        self.run_command_unrecognized_tool(['debug'])
+        self.run_command_unrecognized_tool(['foo', '--quiet'])
 
 
 class TestToolWithOptions(object):
@@ -181,9 +185,9 @@ class TestDebugEvents(TestToolWithOptions, TestLibinputTool):
         self.assertEqual(rc, 0)
 
     def test_invalid_arguments(self):
-        self.run_command_unrecognised_option(['--banana'])
-        self.run_command_unrecognised_option(['--foo'])
-        self.run_command_unrecognised_option(['--version'])
+        self.run_command_unrecognized_option(['--banana'])
+        self.run_command_unrecognized_option(['--foo'])
+        self.run_command_unrecognized_option(['--version'])
 
 
 class TestDebugGUI(TestToolWithOptions, TestLibinputTool):
@@ -199,23 +203,27 @@ class TestDebugGUI(TestToolWithOptions, TestLibinputTool):
         self.assertEqual(rc, 0)
 
     def test_invalid_arguments(self):
-        self.run_command_unrecognised_option(['--quiet'])
-        self.run_command_unrecognised_option(['--banana'])
-        self.run_command_unrecognised_option(['--foo'])
-        self.run_command_unrecognised_option(['--version'])
+        self.run_command_unrecognized_option(['--quiet'])
+        self.run_command_unrecognized_option(['--banana'])
+        self.run_command_unrecognized_option(['--foo'])
+        self.run_command_unrecognized_option(['--version'])
 
 
 if __name__ == '__main__':
+    if os.environ.get('USING_VALGRIND'):
+        sys.exit(77)
+
     parser = argparse.ArgumentParser(description='Verify a libinput tool\'s option parsing')
-    parser.add_argument('tool_path', metavar='/path/to/builddir/libinput',
-                        type=str, nargs='?',
+    parser.add_argument('--tool-path', metavar='/path/to/builddir/libinput',
+                        type=str,
                         help='Path to the libinput tool in the builddir')
     parser.add_argument('--verbose', action='store_true')
-    args = parser.parse_args()
+    args, remainder = parser.parse_known_args()
     if args.tool_path is not None:
         TestLibinputTool.libinput_tool = args.tool_path
     verbosity = 1
     if args.verbose:
         verbosity = 3
-    del sys.argv[1:]
-    unittest.main(verbosity=verbosity)
+
+    argv = [sys.argv[0], *remainder]
+    unittest.main(verbosity=verbosity, argv=argv)

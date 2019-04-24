@@ -22,6 +22,7 @@
  */
 
 #include "config.h"
+#include "litest-config.h"
 
 #ifndef LITEST_H
 #define LITEST_H
@@ -33,6 +34,8 @@
 #include <libevdev/libevdev-uinput.h>
 #include <libinput.h>
 #include <math.h>
+
+#include "check-double-macros.h"
 
 #include "libinput-util.h"
 #include "quirks.h"
@@ -74,24 +77,6 @@ struct test_collection {
 		#name, name##_setup \
 	}; \
 	static void (name##_setup)(void)
-
-extern void litest_setup_tests_udev(void);
-extern void litest_setup_tests_path(void);
-extern void litest_setup_tests_pointer(void);
-extern void litest_setup_tests_touch(void);
-extern void litest_setup_tests_log(void);
-extern void litest_setup_tests_tablet(void);
-extern void litest_setup_tests_pad(void);
-extern void litest_setup_tests_touchpad(void);
-extern void litest_setup_tests_touchpad_tap(void);
-extern void litest_setup_tests_touchpad_buttons(void);
-extern void litest_setup_tests_trackpoint(void);
-extern void litest_setup_tests_trackball(void);
-extern void litest_setup_tests_misc(void);
-extern void litest_setup_tests_keyboard(void);
-extern void litest_setup_tests_device(void);
-extern void litest_setup_tests_gestures(void);
-extern void litest_setup_tests_lid(void);
 
 void
 litest_fail_condition(const char *file,
@@ -295,39 +280,40 @@ enum litest_device_type {
 };
 
 enum litest_device_feature {
-	LITEST_DEVICELESS = -2,
-	LITEST_DISABLE_DEVICE = -1,
-	LITEST_ANY = 0,
-	LITEST_TOUCHPAD = 1 << 0,
-	LITEST_CLICKPAD = 1 << 1,
-	LITEST_BUTTON = 1 << 2,
-	LITEST_KEYS = 1 << 3,
-	LITEST_RELATIVE = 1 << 4,
-	LITEST_WHEEL = 1 << 5,
-	LITEST_TOUCH = 1 << 6,
-	LITEST_SINGLE_TOUCH = 1 << 7,
-	LITEST_APPLE_CLICKPAD = 1 << 8,
-	LITEST_TOPBUTTONPAD = 1 << 9,
-	LITEST_SEMI_MT = 1 << 10,
-	LITEST_POINTINGSTICK = 1 << 11,
-	LITEST_FAKE_MT = 1 << 12,
-	LITEST_ABSOLUTE = 1 << 13,
-	LITEST_PROTOCOL_A = 1 << 14,
-	LITEST_HOVER = 1 << 15,
-	LITEST_ELLIPSE = 1 << 16,
-	LITEST_TABLET = 1 << 17,
-	LITEST_DISTANCE = 1 << 18,
-	LITEST_TOOL_SERIAL = 1 << 19,
-	LITEST_TILT = 1 << 20,
-	LITEST_TABLET_PAD = 1 << 21,
-	LITEST_RING = 1 << 22,
-	LITEST_STRIP = 1 << 23,
-	LITEST_TRACKBALL = 1 << 24,
-	LITEST_LEDS = 1 << 25,
-	LITEST_SWITCH = 1 << 26,
-	LITEST_IGNORED = 1 << 27,
-	LITEST_NO_DEBOUNCE = 1 << 28,
-	LITEST_TOOL_MOUSE = 1 << 29,
+	LITEST_DEVICELESS	= -2,
+	LITEST_DISABLE_DEVICE	= -1,
+	LITEST_ANY		= 0,
+	LITEST_TOUCHPAD		= bit(0),
+	LITEST_CLICKPAD		= bit(1),
+	LITEST_BUTTON		= bit(2),
+	LITEST_KEYS		= bit(3),
+	LITEST_RELATIVE		= bit(4),
+	LITEST_WHEEL		= bit(5),
+	LITEST_TOUCH		= bit(6),
+	LITEST_SINGLE_TOUCH	= bit(7),
+	LITEST_APPLE_CLICKPAD	= bit(8),
+	LITEST_TOPBUTTONPAD	= bit(9),
+	LITEST_SEMI_MT		= bit(10),
+	LITEST_POINTINGSTICK	= bit(11),
+	LITEST_FAKE_MT		= bit(12),
+	LITEST_ABSOLUTE		= bit(13),
+	LITEST_PROTOCOL_A	= bit(14),
+	LITEST_HOVER		= bit(15),
+	LITEST_ELLIPSE		= bit(16),
+	LITEST_TABLET		= bit(17),
+	LITEST_DISTANCE		= bit(18),
+	LITEST_TOOL_SERIAL	= bit(19),
+	LITEST_TILT		= bit(20),
+	LITEST_TABLET_PAD	= bit(21),
+	LITEST_RING		= bit(22),
+	LITEST_STRIP		= bit(23),
+	LITEST_TRACKBALL	= bit(24),
+	LITEST_LEDS		= bit(25),
+	LITEST_SWITCH		= bit(26),
+	LITEST_IGNORED		= bit(27),
+	LITEST_NO_DEBOUNCE	= bit(28),
+	LITEST_TOOL_MOUSE	= bit(29),
+	LITEST_DIRECT		= bit(30),
 };
 
 /* this is a semi-mt device, so we keep track of the touches that the tests
@@ -348,6 +334,7 @@ struct litest_semi_mt {
 };
 
 struct litest_device {
+	enum litest_device_type which;
 	struct libevdev *evdev;
 	struct libevdev_uinput *uinput;
 	struct libinput *libinput;
@@ -529,6 +516,15 @@ litest_touch_move_extended(struct litest_device *d,
 			   struct axis_replacement *axes);
 
 void
+litest_touch_sequence(struct litest_device *d,
+		      unsigned int slot,
+		      double x1,
+		      double y1,
+		      double x2,
+		      double y2,
+		      int steps);
+
+void
 litest_touch_down(struct litest_device *d,
 		  unsigned int slot,
 		  double x,
@@ -663,6 +659,9 @@ litest_wait_for_event_of_type(struct libinput *li, ...);
 
 void
 litest_drain_events(struct libinput *li);
+
+void
+litest_drain_events_of_type(struct libinput *li, ...);
 
 void
 litest_assert_event_type(struct libinput_event *event,
@@ -1111,61 +1110,4 @@ litest_send_file(int sock, int fd)
 	return write(sock, buf, n);
 }
 
-#undef ck_assert_double_eq
-#undef ck_assert_double_ne
-#undef ck_assert_double_lt
-#undef ck_assert_double_le
-#undef ck_assert_double_gt
-#undef ck_assert_double_ge
-
-#define CK_DOUBLE_EQ_EPSILON 1E-3
-#define ck_assert_double_eq(X,Y)  \
-	do { \
-		double _ck_x = X; \
-		double _ck_y = Y; \
-		ck_assert_msg(fabs(_ck_x - _ck_y) < CK_DOUBLE_EQ_EPSILON, \
-			      "Assertion '" #X " == " #Y \
-			      "' failed: "#X"==%f, "#Y"==%f", \
-			      _ck_x, \
-			      _ck_y); \
-	} while (0)
-
-#define ck_assert_double_ne(X,Y)  \
-	do { \
-		double _ck_x = X; \
-		double _ck_y = Y; \
-		ck_assert_msg(fabs(_ck_x - _ck_y) > CK_DOUBLE_EQ_EPSILON, \
-			      "Assertion '" #X " != " #Y \
-			      "' failed: "#X"==%f, "#Y"==%f", \
-			      _ck_x, \
-			      _ck_y); \
-	} while (0)
-
-#define _ck_assert_double_eq(X, OP, Y)  \
-	do { \
-		double _ck_x = X; \
-		double _ck_y = Y; \
-		ck_assert_msg(_ck_x OP _ck_y || \
-			      fabs(_ck_x - _ck_y) < CK_DOUBLE_EQ_EPSILON, \
-			      "Assertion '" #X#OP#Y \
-			      "' failed: "#X"==%f, "#Y"==%f", \
-			      _ck_x, \
-			      _ck_y); \
-	} while (0)
-
-#define _ck_assert_double_ne(X, OP,Y) \
-	do { \
-		double _ck_x = X; \
-		double _ck_y = Y; \
-		ck_assert_msg(_ck_x OP _ck_y && \
-			      fabs(_ck_x - _ck_y) > CK_DOUBLE_EQ_EPSILON, \
-			      "Assertion '" #X#OP#Y \
-			      "' failed: "#X"==%f, "#Y"==%f", \
-			      _ck_x, \
-			      _ck_y); \
-	} while (0)
-#define ck_assert_double_lt(X, Y) _ck_assert_double_ne(X, <, Y)
-#define ck_assert_double_le(X, Y) _ck_assert_double_eq(X, <=, Y)
-#define ck_assert_double_gt(X, Y) _ck_assert_double_ne(X, >, Y)
-#define ck_assert_double_ge(X, Y) _ck_assert_double_eq(X, >=, Y)
 #endif /* LITEST_H */

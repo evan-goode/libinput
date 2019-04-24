@@ -47,13 +47,23 @@
 
 #define clip(val_, min_, max_) min((max_), max((min_), (val_)))
 
+enum touch_state {
+	TOUCH_ACTIVE,
+	TOUCH_ENDED,
+	TOUCH_CANCELLED,
+};
+
 struct touch {
-	int active;
+	enum touch_state state;
 	int x, y;
 };
 
 struct point {
 	double x, y;
+};
+
+struct device_user_data {
+	struct point scroll_accumulated;
 };
 
 struct evdev_device {
@@ -85,14 +95,23 @@ struct window {
 	int absx, absy;
 
 	/* scroll bar positions */
-	double vx, vy;
-	double hx, hy;
+	struct {
+		double vx, vy;
+		double hx, hy;
+
+		double vx_discrete, vy_discrete;
+		double hx_discrete, hy_discrete;
+	} scroll;
 
 	/* touch positions */
 	struct touch touches[32];
 
 	/* l/m/r mouse buttons */
-	int l, m, r;
+	struct {
+		bool l, m, r;
+		bool other;
+		const char *other_name;
+	} buttons;
 
 	/* touchpad swipe */
 	struct {
@@ -312,18 +331,25 @@ draw_gestures(struct window *w, cairo_t *cr)
 	cairo_stroke(cr);
 
 	cairo_restore(cr);
-
 }
 
 static inline void
 draw_scrollbars(struct window *w, cairo_t *cr)
 {
-	cairo_set_source_rgb(cr, .4, .8, 0);
 
+	/* normal scrollbars */
 	cairo_save(cr);
-	cairo_rectangle(cr, w->vx - 10, w->vy - 20, 20, 40);
-	cairo_rectangle(cr, w->hx - 20, w->hy - 10, 40, 20);
+	cairo_set_source_rgb(cr, .4, .8, 0);
+	cairo_rectangle(cr, w->scroll.vx - 10, w->scroll.vy - 20, 20, 40);
+	cairo_rectangle(cr, w->scroll.hx - 20, w->scroll.hy - 10, 40, 20);
 	cairo_fill(cr);
+
+	/* discrete scrollbars */
+	cairo_set_source_rgb(cr, .8, .4, 0);
+	cairo_rectangle(cr, w->scroll.vx_discrete - 5, w->scroll.vy_discrete - 10, 10, 20);
+	cairo_rectangle(cr, w->scroll.hx_discrete - 10, w->scroll.hy_discrete - 5, 20, 10);
+	cairo_fill(cr);
+
 	cairo_restore(cr);
 }
 
@@ -332,24 +358,63 @@ draw_touchpoints(struct window *w, cairo_t *cr)
 {
 	struct touch *t;
 
-	cairo_set_source_rgb(cr, .8, .2, .2);
-
+	cairo_save(cr);
 	ARRAY_FOR_EACH(w->touches, t) {
-		cairo_save(cr);
+		if (t->state == TOUCH_ACTIVE)
+			cairo_set_source_rgb(cr, .8, .2, .2);
+		else
+			cairo_set_source_rgb(cr, .8, .4, .4);
 		cairo_arc(cr, t->x, t->y, 10, 0, 2 * M_PI);
-		cairo_fill(cr);
-		cairo_restore(cr);
+		if (t->state == TOUCH_CANCELLED)
+			cairo_stroke(cr);
+		else
+			cairo_fill(cr);
 	}
+	cairo_restore(cr);
 }
 
 static inline void
 draw_abs_pointer(struct window *w, cairo_t *cr)
 {
-	cairo_set_source_rgb(cr, .2, .4, .8);
 
 	cairo_save(cr);
+	cairo_set_source_rgb(cr, .2, .4, .8);
 	cairo_arc(cr, w->absx, w->absy, 10, 0, 2 * M_PI);
 	cairo_fill(cr);
+	cairo_restore(cr);
+}
+
+static inline void
+draw_other_button (struct window *w, cairo_t *cr)
+{
+	const char *name = w->buttons.other_name;
+	cairo_text_extents_t te;
+	cairo_font_extents_t fe;
+
+	cairo_save(cr);
+
+	if (!w->buttons.other)
+		goto outline;
+
+	if (!name)
+		name = "undefined";
+
+	cairo_set_source_rgb(cr, .2, .8, .8);
+	cairo_rectangle(cr, w->width/2 - 40, w->height - 150, 80, 30);
+	cairo_fill(cr);
+
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	cairo_text_extents(cr, name, &te);
+	cairo_font_extents(cr, &fe);
+	/* center of the rectangle */
+	cairo_move_to(cr, w->width/2, w->height - 150 + 15);
+	cairo_rel_move_to(cr, -te.width/2, -fe.descent + te.height/2);
+	cairo_show_text(cr, name);
+
+outline:
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	cairo_rectangle(cr, w->width/2 - 40, w->height - 150, 80, 30);
+	cairo_stroke(cr);
 	cairo_restore(cr);
 }
 
@@ -357,13 +422,14 @@ static inline void
 draw_buttons(struct window *w, cairo_t *cr)
 {
 	cairo_save(cr);
-	if (w->l || w->m || w->r) {
+
+	if (w->buttons.l || w->buttons.m || w->buttons.r) {
 		cairo_set_source_rgb(cr, .2, .8, .8);
-		if (w->l)
+		if (w->buttons.l)
 			cairo_rectangle(cr, w->width/2 - 100, w->height - 200, 70, 30);
-		if (w->m)
+		if (w->buttons.m)
 			cairo_rectangle(cr, w->width/2 - 20, w->height - 200, 40, 30);
-		if (w->r)
+		if (w->buttons.r)
 			cairo_rectangle(cr, w->width/2 + 30, w->height - 200, 70, 30);
 		cairo_fill(cr);
 	}
@@ -374,6 +440,8 @@ draw_buttons(struct window *w, cairo_t *cr)
 	cairo_rectangle(cr, w->width/2 + 30, w->height - 200, 70, 30);
 	cairo_stroke(cr);
 	cairo_restore(cr);
+
+	draw_other_button(w, cr);
 }
 
 static inline void
@@ -382,34 +450,27 @@ draw_tablet(struct window *w, cairo_t *cr)
 	double x, y;
 	int first, last;
 	size_t mask;
-	int i;
 
 	/* tablet tool, square for prox-in location */
 	cairo_save(cr);
-	cairo_set_source_rgb(cr, .8, .8, .8);
+	cairo_set_source_rgb(cr, .2, .6, .6);
 	if (w->tool.x_in && w->tool.y_in) {
 		cairo_rectangle(cr, w->tool.x_in - 15, w->tool.y_in - 15, 30, 30);
 		cairo_stroke(cr);
-		cairo_restore(cr);
-		cairo_save(cr);
 	}
 
 	if (w->tool.x_down && w->tool.y_down) {
 		cairo_rectangle(cr, w->tool.x_down - 10, w->tool.y_down - 10, 20, 20);
 		cairo_stroke(cr);
-		cairo_restore(cr);
-		cairo_save(cr);
 	}
 
 	if (w->tool.x_up && w->tool.y_up) {
 		cairo_rectangle(cr, w->tool.x_up - 10, w->tool.y_up - 10, 20, 20);
 		cairo_stroke(cr);
-		cairo_restore(cr);
-		cairo_save(cr);
 	}
 
 	if (w->tool.pressure)
-		cairo_set_source_rgb(cr, .8, .8, .2);
+		cairo_set_source_rgb(cr, .2, .8, .8);
 
 	cairo_translate(cr, w->tool.x, w->tool.y);
 	cairo_scale(cr, 1.0 + w->tool.tilt_x/30.0, 1.0 + w->tool.tilt_y/30.0);
@@ -418,26 +479,6 @@ draw_tablet(struct window *w, cairo_t *cr)
 		  0, 2 * M_PI);
 	cairo_fill(cr);
 	cairo_restore(cr);
-
-	/* pointer deltas */
-	mask = ARRAY_LENGTH(w->deltas);
-	first = max(w->ndeltas + 1, mask) - mask;
-	last = w->ndeltas;
-
-	cairo_save(cr);
-	cairo_set_source_rgb(cr, .8, .5, .2);
-
-	x = w->deltas[first % mask].x;
-	y = w->deltas[first % mask].y;
-	cairo_move_to(cr, x, y);
-
-	for (i = first + 1; i < last; i++) {
-		x = w->deltas[i % mask].x;
-		y = w->deltas[i % mask].y;
-		cairo_line_to(cr, x, y);
-	}
-
-	cairo_stroke(cr);
 
 	/* tablet deltas */
 	mask = ARRAY_LENGTH(w->tool.deltas);
@@ -451,19 +492,23 @@ draw_tablet(struct window *w, cairo_t *cr)
 	y = w->tool.deltas[first % mask].y;
 	cairo_move_to(cr, x, y);
 
-	for (i = first + 1; i < last; i++) {
+	for (int i = first + 1; i < last; i++) {
 		x = w->tool.deltas[i % mask].x;
 		y = w->tool.deltas[i % mask].y;
 		cairo_line_to(cr, x, y);
 	}
 
 	cairo_stroke(cr);
-
+	cairo_restore(cr);
 }
 
 static inline void
 draw_pointer(struct window *w, cairo_t *cr)
 {
+	double x, y;
+	int first, last;
+	size_t mask;
+
 	/* draw pointer sprite */
 	cairo_set_source_rgb(cr, 0, 0, 0);
 	cairo_save(cr);
@@ -472,6 +517,25 @@ draw_pointer(struct window *w, cairo_t *cr)
 	cairo_rel_line_to(cr, -10, 0);
 	cairo_rel_line_to(cr, 0, -15);
 	cairo_fill(cr);
+
+	/* pointer deltas */
+	mask = ARRAY_LENGTH(w->deltas);
+	first = max(w->ndeltas + 1, mask) - mask;
+	last = w->ndeltas;
+
+	cairo_set_source_rgb(cr, .8, .5, .2);
+
+	x = w->deltas[first % mask].x;
+	y = w->deltas[first % mask].y;
+	cairo_move_to(cr, x, y);
+
+	for (int i = first + 1; i < last; i++) {
+		x = w->deltas[i % mask].x;
+		y = w->deltas[i % mask].y;
+		cairo_line_to(cr, x, y);
+	}
+
+	cairo_stroke(cr);
 	cairo_restore(cr);
 }
 
@@ -528,6 +592,7 @@ draw_background(struct window *w, cairo_t *cr)
 		cairo_stroke(cr);
 	}
 
+	cairo_restore(cr);
 }
 
 static gboolean
@@ -543,12 +608,12 @@ draw(GtkWidget *widget, cairo_t *cr, gpointer data)
 	draw_evdev_rel(w, cr);
 	draw_evdev_abs(w, cr);
 
+	draw_tablet(w, cr);
 	draw_gestures(w, cr);
 	draw_scrollbars(w, cr);
 	draw_touchpoints(w, cr);
 	draw_abs_pointer(w, cr);
 	draw_buttons(w, cr);
-	draw_tablet(w, cr);
 	draw_pointer(w, cr);
 
 	return TRUE;
@@ -567,10 +632,14 @@ map_event_cb(GtkWidget *widget, GdkEvent *event, gpointer data)
 	w->x = w->width/2;
 	w->y = w->height/2;
 
-	w->vx = w->width/2;
-	w->vy = w->height/2;
-	w->hx = w->width/2;
-	w->hy = w->height/2;
+	w->scroll.vx = w->width/2;
+	w->scroll.vy = w->height/2;
+	w->scroll.hx = w->width/2;
+	w->scroll.hy = w->height/2;
+	w->scroll.vx_discrete = w->width/2;
+	w->scroll.vy_discrete = w->height/2;
+	w->scroll.hx_discrete = w->width/2;
+	w->scroll.hy_discrete = w->height/2;
 
 	w->swipe.x = w->width/2;
 	w->swipe.y = w->height/2;
@@ -752,6 +821,7 @@ register_evdev_device(struct window *w, struct libinput_device *dev)
 	const char *device_node;
 	int fd;
 	struct evdev_device *d;
+	struct device_user_data *data;
 
 	ud = libinput_device_get_udev_device(dev);
 	device_node = udev_device_get_devnode(ud);
@@ -773,6 +843,9 @@ register_evdev_device(struct window *w, struct libinput_device *dev)
 	d->fd = fd;
 	d->evdev = evdev;
 	d->libinput_device =libinput_device_ref(dev);
+
+	data = zalloc(sizeof *data);
+	libinput_device_set_user_data(dev, data);
 
 	c = g_io_channel_unix_new(fd);
 	g_io_channel_set_encoding(c, NULL, NULL);
@@ -796,6 +869,7 @@ unregister_evdev_device(struct window *w, struct libinput_device *dev)
 
 		list_remove(&d->node);
 		g_source_remove(d->source_id);
+		free(libinput_device_get_user_data(d->libinput_device));
 		libinput_device_unref(d->libinput_device);
 		libevdev_free(d->evdev);
 		close(d->fd);
@@ -898,15 +972,21 @@ handle_event_touch(struct libinput_event *ev, struct window *w)
 
 	touch = &w->touches[slot];
 
-	if (libinput_event_get_type(ev) == LIBINPUT_EVENT_TOUCH_UP) {
-		touch->active = 0;
+	switch (libinput_event_get_type(ev)) {
+	case LIBINPUT_EVENT_TOUCH_UP:
+		touch->state = TOUCH_ENDED;
 		return;
+	case LIBINPUT_EVENT_TOUCH_CANCEL:
+		touch->state = TOUCH_CANCELLED;
+		return;
+	default:
+		break;
 	}
 
 	x = libinput_event_touch_get_x_transformed(t, w->width),
 	y = libinput_event_touch_get_y_transformed(t, w->height);
 
-	touch->active = 1;
+	touch->state = TOUCH_ACTIVE;
 	touch->x = (int)x;
 	touch->y = (int)y;
 }
@@ -915,22 +995,45 @@ static void
 handle_event_axis(struct libinput_event *ev, struct window *w)
 {
 	struct libinput_event_pointer *p = libinput_event_get_pointer_event(ev);
+	struct libinput_device *dev = libinput_event_get_device(ev);
+	struct device_user_data *data = libinput_device_get_user_data(dev);
 	double value;
+	int discrete;
+
+	assert(data);
 
 	if (libinput_event_pointer_has_axis(p,
 			LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL)) {
 		value = libinput_event_pointer_get_axis_value(p,
 				LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
-		w->vy += value;
-		w->vy = clip(w->vy, 0, w->height);
+		w->scroll.vy += value;
+		w->scroll.vy = clip(w->scroll.vy, 0, w->height);
+		data->scroll_accumulated.y += value;
+
+		discrete = libinput_event_pointer_get_axis_value_discrete(p,
+				LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
+		if (discrete) {
+			w->scroll.vy_discrete += data->scroll_accumulated.y;
+			w->scroll.vy_discrete = clip(w->scroll.vy_discrete, 0, w->height);
+			data->scroll_accumulated.y = 0;
+		}
 	}
 
 	if (libinput_event_pointer_has_axis(p,
 			LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL)) {
 		value = libinput_event_pointer_get_axis_value(p,
 				LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
-		w->hx += value;
-		w->hx = clip(w->hx, 0, w->width);
+		w->scroll.hx += value;
+		w->scroll.hx = clip(w->scroll.hx, 0, w->width);
+		data->scroll_accumulated.x += value;
+
+		discrete = libinput_event_pointer_get_axis_value_discrete(p,
+				LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
+		if (discrete) {
+			w->scroll.hx_discrete += data->scroll_accumulated.x;
+			w->scroll.hx_discrete = clip(w->scroll.hx_discrete, 0, w->width);
+			data->scroll_accumulated.x = 0;
+		}
 	}
 }
 
@@ -965,20 +1068,24 @@ handle_event_button(struct libinput_event *ev, struct window *w)
 {
 	struct libinput_event_pointer *p = libinput_event_get_pointer_event(ev);
 	unsigned int button = libinput_event_pointer_get_button(p);
-	int is_press;
+	bool is_press;
 
 	is_press = libinput_event_pointer_get_button_state(p) == LIBINPUT_BUTTON_STATE_PRESSED;
 
 	switch (button) {
 	case BTN_LEFT:
-		w->l = is_press;
+		w->buttons.l = is_press;
 		break;
 	case BTN_RIGHT:
-		w->r = is_press;
+		w->buttons.r = is_press;
 		break;
 	case BTN_MIDDLE:
-		w->m = is_press;
+		w->buttons.m = is_press;
 		break;
+	default:
+		w->buttons.other = is_press;
+		w->buttons.other_name = libevdev_event_code_get_name(EV_KEY,
+								     button);
 	}
 
 }
@@ -1145,13 +1252,13 @@ handle_event_libinput(GIOChannel *source, GIOCondition condition, gpointer data)
 		case LIBINPUT_EVENT_TOUCH_DOWN:
 		case LIBINPUT_EVENT_TOUCH_MOTION:
 		case LIBINPUT_EVENT_TOUCH_UP:
+		case LIBINPUT_EVENT_TOUCH_CANCEL:
 			handle_event_touch(ev, w);
+			break;
+		case LIBINPUT_EVENT_TOUCH_FRAME:
 			break;
 		case LIBINPUT_EVENT_POINTER_AXIS:
 			handle_event_axis(ev, w);
-			break;
-		case LIBINPUT_EVENT_TOUCH_CANCEL:
-		case LIBINPUT_EVENT_TOUCH_FRAME:
 			break;
 		case LIBINPUT_EVENT_POINTER_BUTTON:
 			handle_event_button(ev, w);

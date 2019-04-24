@@ -75,6 +75,7 @@ static int
 get_axis_default(struct litest_device *d, unsigned int evcode, int32_t *value)
 {
 	switch (evcode) {
+	case ABS_Z:
 	case ABS_TILT_X:
 	case ABS_TILT_Y:
 		*value = 0;
@@ -143,7 +144,7 @@ static const char udev_rule[] =
 
 TEST_DEVICE("wacom-cintiq-pro16-pen",
 	.type = LITEST_WACOM_CINTIQ_PRO16_PEN,
-	.features = LITEST_TABLET | LITEST_DISTANCE | LITEST_TOOL_SERIAL | LITEST_TILT,
+	.features = LITEST_TABLET | LITEST_DISTANCE | LITEST_TOOL_SERIAL | LITEST_TILT | LITEST_DIRECT | LITEST_HOVER,
 	.interface = &interface,
 
 	.name = "Wacom Cintiq Pro 16 Pen",

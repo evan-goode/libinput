@@ -234,7 +234,7 @@ tablet_process_absolute(struct tablet_dispatch *tablet,
 	/* tool_id is the identifier for the tool we can use in libwacom
 	 * to identify it (if we have one anyway) */
 	case ABS_MISC:
-		tablet->current_tool_id = e->value;
+		tablet->current_tool.id = e->value;
 		break;
 	/* Intuos 3 strip data. Should only happen on the Pad device, not on
 	   the Pen device. */
@@ -278,13 +278,20 @@ tablet_update_tool(struct tablet_dispatch *tablet,
 	assert(tool != LIBINPUT_TOOL_NONE);
 
 	if (enabled) {
-		tablet->current_tool_type = tool;
+		if (tablet->current_tool.is_active)
+			evdev_log_bug_kernel(device,
+					     "Tool directly switched from %d to %d\n",
+					     tablet->current_tool.type,
+					     tool);
+		tablet->current_tool.type = tool;
 		tablet_set_status(tablet, TABLET_TOOL_ENTERING_PROXIMITY);
 		tablet_unset_status(tablet, TABLET_TOOL_OUT_OF_PROXIMITY);
 	}
 	else if (!tablet_has_status(tablet, TABLET_TOOL_OUT_OF_PROXIMITY)) {
 		tablet_set_status(tablet, TABLET_TOOL_LEAVING_PROXIMITY);
 	}
+
+	tablet->current_tool.is_active = enabled;
 }
 
 static inline double
@@ -566,8 +573,8 @@ tablet_update_rotation(struct tablet_dispatch *tablet,
 {
 	/* We must check ROTATION_Z after TILT_X/Y so that the tilt axes are
 	 * already normalized and set if we have the mouse/lens tool */
-	if (tablet->current_tool_type == LIBINPUT_TABLET_TOOL_TYPE_MOUSE ||
-	    tablet->current_tool_type == LIBINPUT_TABLET_TOOL_TYPE_LENS) {
+	if (tablet->current_tool.type == LIBINPUT_TABLET_TOOL_TYPE_MOUSE ||
+	    tablet->current_tool.type == LIBINPUT_TABLET_TOOL_TYPE_LENS) {
 		tablet_update_mouse_rotation(tablet, device);
 		clear_bit(tablet->changed_axes, LIBINPUT_TABLET_TOOL_AXIS_TILT_X);
 		clear_bit(tablet->changed_axes, LIBINPUT_TABLET_TOOL_AXIS_TILT_Y);
@@ -728,10 +735,10 @@ tablet_evcode_to_tool(int code)
 	switch (code) {
 	case BTN_TOOL_PEN:	type = LIBINPUT_TABLET_TOOL_TYPE_PEN;		break;
 	case BTN_TOOL_RUBBER:	type = LIBINPUT_TABLET_TOOL_TYPE_ERASER;	break;
-	case BTN_TOOL_BRUSH:	type = LIBINPUT_TABLET_TOOL_TYPE_BRUSH;	break;
+	case BTN_TOOL_BRUSH:	type = LIBINPUT_TABLET_TOOL_TYPE_BRUSH;		break;
 	case BTN_TOOL_PENCIL:	type = LIBINPUT_TABLET_TOOL_TYPE_PENCIL;	break;
 	case BTN_TOOL_AIRBRUSH:	type = LIBINPUT_TABLET_TOOL_TYPE_AIRBRUSH;	break;
-	case BTN_TOOL_MOUSE:	type = LIBINPUT_TABLET_TOOL_TYPE_MOUSE;	break;
+	case BTN_TOOL_MOUSE:	type = LIBINPUT_TABLET_TOOL_TYPE_MOUSE;		break;
 	case BTN_TOOL_LENS:	type = LIBINPUT_TABLET_TOOL_TYPE_LENS;		break;
 	default:
 		abort();
@@ -819,7 +826,7 @@ tablet_process_misc(struct tablet_dispatch *tablet,
 	switch (e->code) {
 	case MSC_SERIAL:
 		if (e->value != -1)
-			tablet->current_tool_serial = e->value;
+			tablet->current_tool.serial = e->value;
 
 		break;
 	case MSC_SCAN:
@@ -1192,8 +1199,8 @@ sanitize_mouse_lens_rotation(struct tablet_dispatch *tablet)
 {
 	/* If we have a mouse/lens cursor and the tilt changed, the rotation
 	   changed. Mark this, calculate the angle later */
-	if ((tablet->current_tool_type == LIBINPUT_TABLET_TOOL_TYPE_MOUSE ||
-	    tablet->current_tool_type == LIBINPUT_TABLET_TOOL_TYPE_LENS) &&
+	if ((tablet->current_tool.type == LIBINPUT_TABLET_TOOL_TYPE_MOUSE ||
+	    tablet->current_tool.type == LIBINPUT_TABLET_TOOL_TYPE_LENS) &&
 	    (bit_is_set(tablet->changed_axes, LIBINPUT_TABLET_TOOL_AXIS_TILT_X) ||
 	     bit_is_set(tablet->changed_axes, LIBINPUT_TABLET_TOOL_AXIS_TILT_Y)))
 		set_bit(tablet->changed_axes, LIBINPUT_TABLET_TOOL_AXIS_ROTATION_Z);
@@ -1376,6 +1383,69 @@ tablet_update_proximity_state(struct tablet_dispatch *tablet,
 	tablet_set_status(tablet, TABLET_TOOL_LEAVING_PROXIMITY);
 }
 
+static struct phys_rect
+tablet_calculate_arbitration_rect(struct tablet_dispatch *tablet)
+{
+	struct evdev_device *device = tablet->device;
+	struct phys_rect r = {0};
+	struct phys_coords mm;
+
+	mm = evdev_device_units_to_mm(device, &tablet->axes.point);
+
+	/* The rect we disable is 20mm left of the tip, 50mm north of the
+	 * tip, and 200x200mm large.
+	 * If the stylus is tilted left (tip further right than the eraser
+	 * end) assume left-handed mode.
+	 *
+	 * Obviously if we'd run out of the boundaries, we rescale the rect
+	 * accordingly.
+	 */
+	if (tablet->axes.tilt.x > 0) {
+		r.x = mm.x - 20;
+		r.w = 200;
+	} else {
+		r.x = mm.x + 20;
+		r.w = 200;
+		r.x -= r.w;
+	}
+
+	if (r.x < 0) {
+		r.w -= r.x;
+		r.x = 0;
+	}
+
+	r.y = mm.y - 50;
+	r.h = 200;
+	if (r.y < 0) {
+		r.h -= r.y;
+		r.y = 0;
+	}
+
+	return r;
+}
+
+static inline void
+tablet_update_touch_device_rect(struct tablet_dispatch *tablet,
+				const struct tablet_axes *axes,
+				uint64_t time)
+{
+	struct evdev_dispatch *dispatch;
+	struct phys_rect rect = {0};
+
+	if (tablet->touch_device == NULL ||
+	    tablet->arbitration != ARBITRATION_IGNORE_RECT)
+		return;
+
+	rect = tablet_calculate_arbitration_rect(tablet);
+
+	dispatch = tablet->touch_device->dispatch;
+	if (dispatch->interface->touch_arbitration_update_rect)
+		dispatch->interface->touch_arbitration_update_rect(dispatch,
+								   tablet->touch_device,
+								   &rect,
+								   time);
+}
+
 static inline bool
 tablet_send_proximity_in(struct tablet_dispatch *tablet,
 			 struct libinput_tablet_tool *tool,
@@ -1549,7 +1619,8 @@ tablet_send_events(struct tablet_dispatch *tablet,
 		 * update */
 		tablet_unset_status(tablet, TABLET_AXES_UPDATED);
 	} else {
-		tablet_check_notify_axes(tablet, device, tool, &axes, time);
+		if (tablet_check_notify_axes(tablet, device, tool, &axes, time))
+			tablet_update_touch_device_rect(tablet, &axes, time);
 	}
 
 	assert(tablet->axes.delta.x == 0);
@@ -1577,13 +1648,13 @@ tablet_flush(struct tablet_dispatch *tablet,
 {
 	struct libinput_tablet_tool *tool;
 
-	if (tablet->current_tool_type == LIBINPUT_TOOL_NONE)
+	if (tablet->current_tool.type == LIBINPUT_TOOL_NONE)
 		return;
 
 	tool = tablet_get_tool(tablet,
-			       tablet->current_tool_type,
-			       tablet->current_tool_id,
-			       tablet->current_tool_serial);
+			       tablet->current_tool.type,
+			       tablet->current_tool.id,
+			       tablet->current_tool.serial);
 
 	if (!tool)
 		return; /* OOM */
@@ -1618,21 +1689,26 @@ tablet_flush(struct tablet_dispatch *tablet,
 }
 
 static inline void
-tablet_set_touch_device_enabled(struct evdev_device *touch_device,
-				bool enable,
+tablet_set_touch_device_enabled(struct tablet_dispatch *tablet,
+				enum evdev_arbitration_state which,
+				const struct phys_rect *rect,
 				uint64_t time)
 {
+	struct evdev_device *touch_device = tablet->touch_device;
 	struct evdev_dispatch *dispatch;
 
 	if (touch_device == NULL)
 		return;
 
+	tablet->arbitration = which;
+
 	dispatch = touch_device->dispatch;
-	if (dispatch->interface->toggle_touch)
-		dispatch->interface->toggle_touch(dispatch,
-						  touch_device,
-						  enable,
-						  time);
+	if (dispatch->interface->touch_arbitration_toggle)
+		dispatch->interface->touch_arbitration_toggle(dispatch,
+							      touch_device,
+							      which,
+							      rect,
+							      time);
 }
 
 static inline void
@@ -1640,18 +1716,33 @@ tablet_toggle_touch_device(struct tablet_dispatch *tablet,
 			   struct evdev_device *tablet_device,
 			   uint64_t time)
 {
-	bool enable_events;
+	enum evdev_arbitration_state which;
+	struct phys_rect r = {0};
+	struct phys_rect *rect = NULL;
 
-	enable_events = tablet_has_status(tablet,
-					  TABLET_TOOL_OUT_OF_RANGE) ||
-			tablet_has_status(tablet, TABLET_NONE) ||
-			tablet_has_status(tablet,
-					  TABLET_TOOL_LEAVING_PROXIMITY) ||
-			tablet_has_status(tablet,
-					  TABLET_TOOL_OUT_OF_PROXIMITY);
+	if (tablet_has_status(tablet,
+			      TABLET_TOOL_OUT_OF_RANGE) ||
+	    tablet_has_status(tablet, TABLET_NONE) ||
+	    tablet_has_status(tablet,
+			      TABLET_TOOL_LEAVING_PROXIMITY) ||
+	    tablet_has_status(tablet,
+			      TABLET_TOOL_OUT_OF_PROXIMITY)) {
+		which = ARBITRATION_NOT_ACTIVE;
+	} else if (tablet->axes.tilt.x == 0) {
+		which = ARBITRATION_IGNORE_ALL;
+	} else if (tablet->arbitration != ARBITRATION_IGNORE_RECT) {
+		/* This enables rect-based arbitration, updates are sent
+		 * elsewhere */
+		r = tablet_calculate_arbitration_rect(tablet);
+		rect = &r;
+		which = ARBITRATION_IGNORE_RECT;
+	} else {
+		return;
+	}
 
-	tablet_set_touch_device_enabled(tablet->touch_device,
-					enable_events,
+	tablet_set_touch_device_enabled(tablet,
+					which,
+					rect,
 					time);
 }
 
@@ -1697,6 +1788,8 @@ tablet_proximity_out_quirk_timer_func(uint64_t now, void *data)
 		return;
 	}
 
+	evdev_log_debug(tablet->device, "tablet: forcing proximity after timeout\n");
+
 	tablet->quirks.proximity_out_in_progress = true;
 	ARRAY_FOR_EACH(events, e) {
 		tablet->base.interface->process(&tablet->base,
@@ -1739,7 +1832,7 @@ tablet_proximity_quirk_update(struct tablet_dispatch *tablet,
 	 * BTN_TOOL_PEN and move on from there. */
 	if (e->type == EV_SYN &&
 	    tablet_has_status(tablet, TABLET_AXES_UPDATED) &&
-	    tablet->current_tool_type == LIBINPUT_TOOL_NONE) {
+	    tablet->current_tool.type == LIBINPUT_TOOL_NONE) {
 		tablet->quirks.proximity_out_forced = true;
 		tablet->quirks.need_to_force_prox_out = true;
 	}
@@ -1830,7 +1923,10 @@ tablet_suspend(struct evdev_dispatch *dispatch,
 	struct libinput *li = tablet_libinput_context(tablet);
 	uint64_t now = libinput_now(li);
 
-	tablet_set_touch_device_enabled(tablet->touch_device, true, now);
+	tablet_set_touch_device_enabled(tablet,
+					ARBITRATION_NOT_ACTIVE,
+					NULL,
+					now);
 
 	if (!tablet_has_status(tablet, TABLET_TOOL_OUT_OF_PROXIMITY)) {
 		tablet_set_status(tablet, TABLET_TOOL_LEAVING_PROXIMITY);
@@ -1913,7 +2009,7 @@ tablet_check_initial_proximity(struct evdev_device *device,
 	if (tablet->quirks.need_to_force_prox_out)
 		tablet_proximity_out_quirk_set_timer(tablet, libinput_now(li));
 
-	tablet->current_tool_id =
+	tablet->current_tool.id =
 		libevdev_get_event_value(device->evdev,
 					 EV_ABS,
 					 ABS_MISC);
@@ -1922,7 +2018,7 @@ tablet_check_initial_proximity(struct evdev_device *device,
 	 * to 0 for now. On the first real event from the device we get the
 	 * serial (if any) and that event will be converted into a proximity
 	 * event */
-	tablet->current_tool_serial = 0;
+	tablet->current_tool.serial = 0;
 }
 
 static struct evdev_dispatch_interface tablet_interface = {
@@ -1935,7 +2031,8 @@ static struct evdev_dispatch_interface tablet_interface = {
 	.device_suspended = NULL,
 	.device_resumed = NULL,
 	.post_added = tablet_check_initial_proximity,
-	.toggle_touch = NULL,
+	.touch_arbitration_toggle = NULL,
+	.touch_arbitration_update_rect = NULL,
 	.get_switch_state = NULL,
 };
 
@@ -2062,14 +2159,14 @@ tablet_init(struct tablet_dispatch *tablet,
 {
 	struct libevdev *evdev = device->evdev;
 	enum libinput_tablet_tool_axis axis;
-	bool want_proximity_quirk = false;
 	int rc;
 
 	tablet->base.dispatch_type = DISPATCH_TABLET;
 	tablet->base.interface = &tablet_interface;
 	tablet->device = device;
 	tablet->status = TABLET_NONE;
-	tablet->current_tool_type = LIBINPUT_TOOL_NONE;
+	tablet->current_tool.type = LIBINPUT_TOOL_NONE;
+	tablet->current_tool.is_active = false;
 	list_init(&tablet->tool_list);
 
 	if (tablet_reject_device(device))
@@ -2077,7 +2174,6 @@ tablet_init(struct tablet_dispatch *tablet,
 
 	if (!libevdev_has_event_code(evdev, EV_KEY, BTN_TOOL_PEN)) {
 		libevdev_enable_event_code(evdev, EV_KEY, BTN_TOOL_PEN, NULL);
-		want_proximity_quirk = true;
 		tablet->quirks.proximity_out_forced = true;
 	}
 
@@ -2105,12 +2201,9 @@ tablet_init(struct tablet_dispatch *tablet,
 
 	tablet_set_status(tablet, TABLET_TOOL_OUT_OF_PROXIMITY);
 
-	if (evdev_device_has_model_quirk(device,
-					 QUIRK_MODEL_TABLET_NO_PROXIMITY_OUT))
-		want_proximity_quirk = true;
-
-	if (want_proximity_quirk)
-		tablet->quirks.need_to_force_prox_out = true;
+	/* We always enable the proximity out quirk, but disable it once a
+	   device gives us the right event sequence */
+	tablet->quirks.need_to_force_prox_out = true;
 
 	libinput_timer_init(&tablet->quirks.prox_out_timer,
 			    tablet_libinput_context(tablet),

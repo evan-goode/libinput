@@ -34,17 +34,17 @@
 #define TABLET_HISTORY_LENGTH 4
 
 enum tablet_status {
-	TABLET_NONE = 0,
-	TABLET_AXES_UPDATED = 1 << 0,
-	TABLET_BUTTONS_PRESSED = 1 << 1,
-	TABLET_BUTTONS_RELEASED = 1 << 2,
-	TABLET_TOOL_IN_CONTACT = 1 << 3,
-	TABLET_TOOL_LEAVING_PROXIMITY = 1 << 4,
-	TABLET_TOOL_OUT_OF_PROXIMITY = 1 << 5,
-	TABLET_TOOL_ENTERING_PROXIMITY = 1 << 6,
-	TABLET_TOOL_ENTERING_CONTACT = 1 << 7,
-	TABLET_TOOL_LEAVING_CONTACT = 1 << 8,
-	TABLET_TOOL_OUT_OF_RANGE = 1 << 9,
+	TABLET_NONE			= 0,
+	TABLET_AXES_UPDATED		= bit(0),
+	TABLET_BUTTONS_PRESSED		= bit(1),
+	TABLET_BUTTONS_RELEASED		= bit(2),
+	TABLET_TOOL_IN_CONTACT		= bit(3),
+	TABLET_TOOL_LEAVING_PROXIMITY	= bit(4),
+	TABLET_TOOL_OUT_OF_PROXIMITY	= bit(5),
+	TABLET_TOOL_ENTERING_PROXIMITY	= bit(6),
+	TABLET_TOOL_ENTERING_CONTACT	= bit(7),
+	TABLET_TOOL_LEAVING_CONTACT	= bit(8),
+	TABLET_TOOL_OUT_OF_RANGE	= bit(9),
 };
 
 struct button_state {
@@ -74,9 +74,13 @@ struct tablet_dispatch {
 	struct button_state button_state;
 	struct button_state prev_button_state;
 
-	enum libinput_tablet_tool_type current_tool_type;
-	uint32_t current_tool_id;
-	uint32_t current_tool_serial;
+	struct {
+		enum libinput_tablet_tool_type type;
+		uint32_t id;
+		uint32_t serial;
+
+		bool is_active;	 /* evdev protocol state */
+	} current_tool;
 
 	uint32_t cursor_proximity_threshold;
 
@@ -84,6 +88,7 @@ struct tablet_dispatch {
 
 	/* The paired touch device on devices with both pen & touch */
 	struct evdev_device *touch_device;
+	enum evdev_arbitration_state arbitration;
 
 	struct {
 		bool need_to_force_prox_out;
