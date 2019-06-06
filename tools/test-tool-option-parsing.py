@@ -26,6 +26,7 @@
 import argparse
 import os
 import unittest
+import resource
 import sys
 import subprocess
 import time
@@ -35,12 +36,16 @@ class TestLibinputTool(unittest.TestCase):
     libinput_tool = 'libinput'
     subtool = None
 
+    def _disable_coredump(self):
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
     def run_command(self, args):
         args = [self.libinput_tool] + args
         if self.subtool is not None:
             args.insert(1, self.subtool)
 
-        with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
+        with subprocess.Popen(args, preexec_fn=self._disable_coredump,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
             try:
                 p.wait(0.7)
             except subprocess.TimeoutExpired:
@@ -170,6 +175,12 @@ class TestToolWithOptions(object):
             self.run_command_success(['--{}'.format(option), str(maximum)])
             self.run_command_success(['--{}={}'.format(option, maximum)])
 
+    def test_apply_to(self):
+        self.run_command_missing_arg(['--apply-to'])
+        self.run_command_success(['--apply-to', '*foo*'])
+        self.run_command_success(['--apply-to', 'foobar'])
+        self.run_command_success(['--apply-to', 'any'])
+
 
 class TestDebugEvents(TestToolWithOptions, TestLibinputTool):
     subtool = 'debug-events'
@@ -210,9 +221,6 @@ class TestDebugGUI(TestToolWithOptions, TestLibinputTool):
 
 
 if __name__ == '__main__':
-    if os.environ.get('USING_VALGRIND'):
-        sys.exit(77)
-
     parser = argparse.ArgumentParser(description='Verify a libinput tool\'s option parsing')
     parser.add_argument('--tool-path', metavar='/path/to/builddir/libinput',
                         type=str,

@@ -54,6 +54,8 @@
 #include <termios.h>
 #endif
 
+#include <valgrind/valgrind.h>
+
 #include "litest.h"
 #include "litest-int.h"
 #include "libinput-util.h"
@@ -115,6 +117,11 @@ litest_backtrace(void)
 #if HAVE_GSTACK
 	pid_t parent, child;
 	int pipefd[2];
+
+	if (RUNNING_ON_VALGRIND) {
+		litest_log("  Using valgrind, omitting backtrace\n");
+		return;
+	}
 
 	if (pipe(pipefd) == -1)
 		return;
@@ -623,7 +630,7 @@ litest_log_handler(struct libinput *libinput,
 		/* valgrind is too slow and some of our offsets are too
 		 * short, don't abort if during a valgrind run we get a
 		 * negative offset */
-		if (!getenv("USING_VALGRIND") ||
+		if (!RUNNING_ON_VALGRIND ||
 		    !strstr(format, "offset negative"))
 		litest_abort_msg("libinput bug triggered, aborting.\n");
 	}
@@ -843,11 +850,22 @@ litest_run_suite(struct list *tests, int which, int max, int error_fd)
 
 		trs = srunner_failures(sr);
 		for (int i = 0; i < failed; i++) {
+			char tname[256];
+			char *c = tname;
+
+			/* tr_tcname is in the form "suite:testcase", let's
+			 * convert this to "suite(testcase)" to make
+			 * double-click selection in the terminal a bit
+			 * easier. */
+			snprintf(tname, sizeof(tname), "%s)", tr_tcname(trs[i]));
+			if ((c = index(c, ':')))
+				*c = '(';
+
 			dprintf(error_fd,
-				":: Failure: %s:%d:%s\n",
+				":: Failure: %s:%d: %s\n",
 				tr_lfile(trs[i]),
 				tr_lno(trs[i]),
-				tr_tcname(trs[i]));
+				tname);
 		}
 		free(trs);
 	}
@@ -898,7 +916,7 @@ litest_fork_subtests(struct list *tests, int max_forks)
 
 	/* parent process only */
 	while (wait(&status) != -1 && errno != ECHILD) {
-		if (WEXITSTATUS(status) != 0)
+		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 			failed = 1;
 	}
 
@@ -3944,6 +3962,7 @@ litest_parse_argv(int argc, char **argv)
 		JOBS_CUSTOM
 	} want_jobs = JOBS_DEFAULT;
 	char *builddir;
+	char *jobs_env;
 
 	/* If we are not running from the builddir, we assume we're running
 	 * against the system as installed */
@@ -3954,6 +3973,13 @@ litest_parse_argv(int argc, char **argv)
 
 	if (in_debugger)
 		want_jobs = JOBS_SINGLE;
+
+	if ((jobs_env = getenv("LITEST_JOBS"))) {
+		if (!safe_atoi(jobs_env, &jobs)) {
+			fprintf(stderr, "LITEST_JOBS environment variable must be positive integer\n");
+			exit(EXIT_FAILURE);
+		}
+	}
 
 	while(1) {
 		int c;
@@ -3979,7 +4005,8 @@ litest_parse_argv(int argc, char **argv)
 			       "    --verbose\n"
 			       "          Enable verbose output\n"
 			       "    --jobs 8\n"
-			       "          Number of parallel test suites to run (default: 8)\n"
+			       "          Number of parallel test suites to run (default: 8).\n"
+			       "	  This overrides the LITEST_JOBS environment variable.\n"
 			       "    --list\n"
 			       "          List all tests\n"
 			       "\n"
@@ -4166,21 +4193,15 @@ main(int argc, char **argv)
 	int rc;
 
 	in_debugger = is_debugger_attached();
-	if (in_debugger)
+	if (in_debugger || RUNNING_ON_VALGRIND)
 		setenv("CK_FORK", "no", 0);
 
 	mode = litest_parse_argv(argc, argv);
 	if (mode == LITEST_MODE_ERROR)
 		return EXIT_FAILURE;
 
-	/* You don't get to skip the deviceless tests */
-	if (!run_deviceless) {
-		if (getenv("SKIP_LIBINPUT_TEST_SUITE_RUNNER"))
-			return 77;
-
-		if ((rc = check_device_access()) != 0)
+	if (!run_deviceless && (rc = check_device_access()) != 0)
 			return rc;
-	}
 
 	litest_init_test_devices();
 

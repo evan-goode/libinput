@@ -33,6 +33,11 @@
 #include <libwacom/libwacom.h>
 #endif
 
+enum notify {
+	DONT_NOTIFY,
+	DO_NOTIFY,
+};
+
 /* The tablet sends events every ~2ms , 50ms should be plenty enough to
    detect out-of-range.
    This value is higher during test suite runs */
@@ -256,17 +261,57 @@ tablet_process_absolute(struct tablet_dispatch *tablet,
 }
 
 static void
-tablet_change_to_left_handed(struct evdev_device *device)
+tablet_apply_rotation(struct evdev_device *device)
 {
 	struct tablet_dispatch *tablet = tablet_dispatch(device->dispatch);
 
-	if (device->left_handed.enabled == device->left_handed.want_enabled)
+	if (tablet->rotation.rotate == tablet->rotation.want_rotate)
 		return;
 
 	if (!tablet_has_status(tablet, TABLET_TOOL_OUT_OF_PROXIMITY))
 		return;
 
+	tablet->rotation.rotate = tablet->rotation.want_rotate;
+
+	evdev_log_debug(device,
+			"tablet-rotation: rotation is %s\n",
+			tablet->rotation.rotate ? "on" : "off");
+}
+
+static void
+tablet_change_rotation(struct evdev_device *device, enum notify notify)
+{
+	struct tablet_dispatch *tablet = tablet_dispatch(device->dispatch);
+	struct evdev_device *touch_device = tablet->touch_device;
+	struct evdev_dispatch *dispatch;
+	bool tablet_is_left, touchpad_is_left;
+
+	tablet_is_left = tablet->device->left_handed.enabled;
+	touchpad_is_left = tablet->rotation.touch_device_left_handed_state;
+
+	tablet->rotation.want_rotate = tablet_is_left || touchpad_is_left;
+	tablet_apply_rotation(device);
+
+	if (notify == DO_NOTIFY && touch_device) {
+		bool enable = device->left_handed.want_enabled;
+
+		dispatch = touch_device->dispatch;
+		if (dispatch->interface->left_handed_toggle)
+			dispatch->interface->left_handed_toggle(dispatch,
+								touch_device,
+								enable);
+	}
+}
+
+static void
+tablet_change_to_left_handed(struct evdev_device *device)
+{
+	if (device->left_handed.enabled == device->left_handed.want_enabled)
+		return;
+
 	device->left_handed.enabled = device->left_handed.want_enabled;
+
+	tablet_change_rotation(device, DO_NOTIFY);
 }
 
 static void
@@ -405,7 +450,7 @@ tablet_update_xy(struct tablet_dispatch *tablet,
 	    bit_is_set(tablet->changed_axes, LIBINPUT_TABLET_TOOL_AXIS_Y)) {
 		absinfo = libevdev_get_abs_info(device->evdev, ABS_X);
 
-		if (device->left_handed.enabled)
+		if (tablet->rotation.rotate)
 			value = invert_axis(absinfo);
 		else
 			value = absinfo->value;
@@ -414,7 +459,7 @@ tablet_update_xy(struct tablet_dispatch *tablet,
 
 		absinfo = libevdev_get_abs_info(device->evdev, ABS_Y);
 
-		if (device->left_handed.enabled)
+		if (tablet->rotation.rotate)
 			value = invert_axis(absinfo);
 		else
 			value = absinfo->value;
@@ -868,15 +913,13 @@ tool_set_bits_from_libwacom(const struct tablet_dispatch *tablet,
 	WacomStylusType type;
 	WacomAxisTypeFlags axes;
 
-	db = libwacom_database_new();
-	if (!db) {
-		evdev_log_info(tablet->device,
-			       "Failed to initialize libwacom context.\n");
-		goto out;
-	}
+	db = tablet_libinput_context(tablet)->libwacom.db;
+	if (!db)
+		return rc;
+
 	s = libwacom_stylus_get_for_id(db, tool->tool_id);
 	if (!s)
-		goto out;
+		return rc;
 
 	type = libwacom_stylus_get_type(s);
 	if (type == WSTYLUS_PUCK) {
@@ -920,9 +963,6 @@ tool_set_bits_from_libwacom(const struct tablet_dispatch *tablet,
 		copy_axis_cap(tablet, tool, LIBINPUT_TABLET_TOOL_AXIS_PRESSURE);
 
 	rc = 0;
-out:
-	if (db)
-		libwacom_database_destroy(db);
 #endif
 	return rc;
 }
@@ -1633,6 +1673,7 @@ tablet_send_events(struct tablet_dispatch *tablet,
 
 	if (tablet_send_proximity_out(tablet, tool, device, &axes, time)) {
 		tablet_change_to_left_handed(device);
+		tablet_apply_rotation(device);
 		tablet_history_reset(tablet);
 	}
 }
@@ -1718,10 +1759,11 @@ tablet_update_tool_state(struct tablet_dispatch *tablet,
 			 * events it means the tablet will give us the right
 			 * events after all and we can disable our
 			 * timer-based proximity out.
+			 *
+			 * We can't do so permanently though, some tablets
+			 * send the correct event sequence occasionally but
+			 * are broken otherwise.
 			 */
-			if (!tablet->quirks.proximity_out_in_progress)
-				tablet->quirks.need_to_force_prox_out = false;
-
 			libinput_timer_cancel(&tablet->quirks.prox_out_timer);
 		}
 	}
@@ -1873,14 +1915,12 @@ tablet_proximity_out_quirk_timer_func(uint64_t now, void *data)
 
 	evdev_log_debug(tablet->device, "tablet: forcing proximity after timeout\n");
 
-	tablet->quirks.proximity_out_in_progress = true;
 	ARRAY_FOR_EACH(events, e) {
 		tablet->base.interface->process(&tablet->base,
 						 tablet->device,
 						 e,
 						 now);
 	}
-	tablet->quirks.proximity_out_in_progress = false;
 
 	tablet->quirks.proximity_out_forced = true;
 }
@@ -1945,6 +1985,7 @@ tablet_destroy(struct evdev_dispatch *dispatch)
 {
 	struct tablet_dispatch *tablet = tablet_dispatch(dispatch);
 	struct libinput_tablet_tool *tool, *tmp;
+	struct libinput *li = tablet_libinput_context(tablet);
 
 	libinput_timer_cancel(&tablet->quirks.prox_out_timer);
 	libinput_timer_destroy(&tablet->quirks.prox_out_timer);
@@ -1952,6 +1993,8 @@ tablet_destroy(struct evdev_dispatch *dispatch)
 	list_for_each_safe(tool, tmp, &tablet->tool_list, link) {
 		libinput_tablet_tool_unref(tool);
 	}
+
+	libinput_libwacom_unref(li);
 
 	free(tablet);
 }
@@ -1961,16 +2004,39 @@ tablet_device_added(struct evdev_device *device,
 		    struct evdev_device *added_device)
 {
 	struct tablet_dispatch *tablet = tablet_dispatch(device->dispatch);
+	bool is_touchscreen, is_ext_touchpad;
 
 	if (libinput_device_get_device_group(&device->base) !=
 	    libinput_device_get_device_group(&added_device->base))
 		return;
 
+	is_touchscreen = evdev_device_has_capability(added_device,
+						     LIBINPUT_DEVICE_CAP_TOUCH);
+	is_ext_touchpad = evdev_device_has_capability(added_device,
+						      LIBINPUT_DEVICE_CAP_POINTER) &&
+			  (added_device->tags & EVDEV_TAG_EXTERNAL_TOUCHPAD);
 	/* Touch screens or external touchpads only */
-	if (evdev_device_has_capability(added_device, LIBINPUT_DEVICE_CAP_TOUCH) ||
-	    (evdev_device_has_capability(added_device, LIBINPUT_DEVICE_CAP_POINTER) &&
-	     (added_device->tags & EVDEV_TAG_EXTERNAL_TOUCHPAD)))
-	    tablet->touch_device = added_device;
+	if (is_touchscreen || is_ext_touchpad) {
+		evdev_log_debug(device,
+				"touch-arbitration: activated for %s<->%s\n",
+				device->devname,
+				added_device->devname);
+		tablet->touch_device = added_device;
+	}
+
+	if (is_ext_touchpad) {
+		evdev_log_debug(device,
+				"tablet-rotation: %s will rotate %s\n",
+				device->devname,
+				added_device->devname);
+		tablet->rotation.touch_device = added_device;
+
+		if (libinput_device_config_left_handed_get(&added_device->base)) {
+			tablet->rotation.touch_device_left_handed_state = true;
+			tablet_change_rotation(device, DO_NOTIFY);
+		}
+	}
+
 }
 
 static void
@@ -1981,6 +2047,12 @@ tablet_device_removed(struct evdev_device *device,
 
 	if (tablet->touch_device == removed_device)
 		tablet->touch_device = NULL;
+
+	if (tablet->rotation.touch_device == removed_device) {
+		tablet->rotation.touch_device = NULL;
+		tablet->rotation.touch_device_left_handed_state = false;
+		tablet_change_rotation(device, DO_NOTIFY);
+	}
 }
 
 static void
@@ -2012,8 +2084,7 @@ tablet_check_initial_proximity(struct evdev_device *device,
 		return;
 
 	tablet_update_tool(tablet, device, tool, state);
-	if (tablet->quirks.need_to_force_prox_out)
-		tablet_proximity_out_quirk_set_timer(tablet, libinput_now(li));
+	tablet_proximity_out_quirk_set_timer(tablet, libinput_now(li));
 
 	tablet->current_tool.id =
 		libevdev_get_event_value(device->evdev,
@@ -2025,6 +2096,30 @@ tablet_check_initial_proximity(struct evdev_device *device,
 	 * serial (if any) and that event will be converted into a proximity
 	 * event */
 	tablet->current_tool.serial = 0;
+}
+
+/* Called when the touchpad toggles to left-handed */
+static void
+tablet_left_handed_toggled(struct evdev_dispatch *dispatch,
+			   struct evdev_device *device,
+			   bool left_handed_enabled)
+{
+	struct tablet_dispatch *tablet = tablet_dispatch(dispatch);
+
+	if (!tablet->rotation.touch_device)
+		return;
+
+	evdev_log_debug(device,
+			"tablet-rotation: touchpad is %s\n",
+			left_handed_enabled ? "left-handed" : "right-handed");
+
+	/* Our left-handed config is independent even though rotation is
+	 * locked. So we rotate when either device is left-handed. But it
+	 * can only be actually changed when the device is in a neutral
+	 * state, hence the want_rotate.
+	 */
+	tablet->rotation.touch_device_left_handed_state = left_handed_enabled;
+	tablet_change_rotation(device, DONT_NOTIFY);
 }
 
 static struct evdev_dispatch_interface tablet_interface = {
@@ -2040,6 +2135,7 @@ static struct evdev_dispatch_interface tablet_interface = {
 	.touch_arbitration_toggle = NULL,
 	.touch_arbitration_update_rect = NULL,
 	.get_switch_state = NULL,
+	.left_handed_toggle = tablet_left_handed_toggled,
 };
 
 static void
@@ -2129,8 +2225,8 @@ static void
 tablet_init_left_handed(struct evdev_device *device)
 {
 	if (evdev_tablet_has_left_handed(device))
-		    evdev_init_left_handed(device,
-					   tablet_change_to_left_handed);
+		evdev_init_left_handed(device,
+				       tablet_change_to_left_handed);
 }
 
 static bool
@@ -2206,10 +2302,6 @@ tablet_init(struct tablet_dispatch *tablet,
 
 	tablet_set_status(tablet, TABLET_TOOL_OUT_OF_PROXIMITY);
 
-	/* We always enable the proximity out quirk, but disable it once a
-	   device gives us the right event sequence */
-	tablet->quirks.need_to_force_prox_out = true;
-
 	libinput_timer_init(&tablet->quirks.prox_out_timer,
 			    tablet_libinput_context(tablet),
 			    "proxout",
@@ -2223,6 +2315,9 @@ struct evdev_dispatch *
 evdev_tablet_create(struct evdev_device *device)
 {
 	struct tablet_dispatch *tablet;
+	struct libinput *li = evdev_libinput_context(device);
+
+	libinput_libwacom_ref(li);
 
 	/* Stop false positives caused by the forced proximity code */
 	if (getenv("LIBINPUT_RUNNING_TEST_SUITE"))
