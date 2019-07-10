@@ -806,6 +806,7 @@ tablet_process_key(struct tablet_dispatch *tablet,
 	case BTN_TOOL_MOUSE:
 	case BTN_TOOL_LENS:
 		type = tablet_evcode_to_tool(e->code);
+		tablet_set_status(tablet, TABLET_TOOL_UPDATED);
 		if (e->value)
 			tablet->tool_state |= bit(type);
 		else
@@ -1701,8 +1702,9 @@ static inline void
 tablet_proximity_out_quirk_set_timer(struct tablet_dispatch *tablet,
 				     uint64_t time)
 {
-	libinput_timer_set(&tablet->quirks.prox_out_timer,
-			   time + FORCED_PROXOUT_TIMEOUT);
+	if (tablet->quirks.need_to_force_prox_out)
+		libinput_timer_set(&tablet->quirks.prox_out_timer,
+				   time + FORCED_PROXOUT_TIMEOUT);
 }
 
 static void
@@ -1721,13 +1723,22 @@ tablet_update_tool_state(struct tablet_dispatch *tablet,
 	 *   BTN_TOOL_PEN and the state for the tool was 0, this device will
 	 *   never send the event.
 	 * We don't do this for pure button events because we discard those.
+	 *
+	 * But: on some devices the proximity out is delayed by the kernel,
+	 * so we get it after our forced prox-out has triggered. In that
+	 * case we need to just ignore the change.
 	 */
-	if (tablet_has_status(tablet, TABLET_AXES_UPDATED) &&
-	    (tablet->quirks.proximity_out_forced ||
-	     (tablet->tool_state == 0 &&
-	      tablet->current_tool.type == LIBINPUT_TOOL_NONE))) {
-		tablet->tool_state = bit(LIBINPUT_TABLET_TOOL_TYPE_PEN);
-		tablet->quirks.proximity_out_forced = false;
+	if (tablet_has_status(tablet, TABLET_AXES_UPDATED)) {
+		if (tablet->quirks.proximity_out_forced) {
+			if (!tablet_has_status(tablet, TABLET_TOOL_UPDATED) ||
+			    tablet->tool_state)
+				tablet->tool_state = bit(LIBINPUT_TABLET_TOOL_TYPE_PEN);
+			tablet->quirks.proximity_out_forced = false;
+		} else if (tablet->tool_state == 0 &&
+			    tablet->current_tool.type == LIBINPUT_TOOL_NONE) {
+			tablet->tool_state = bit(LIBINPUT_TABLET_TOOL_TYPE_PEN);
+			tablet->quirks.proximity_out_forced = false;
+		}
 	}
 
 	if (tablet->tool_state == tablet->prev_tool_state)
@@ -1735,7 +1746,7 @@ tablet_update_tool_state(struct tablet_dispatch *tablet,
 
 	/* Kernel tools are supposed to be mutually exclusive, if we have
 	 * two set discard the most recent one. */
-	if (__builtin_popcount(tablet->tool_state) > 1) {
+	if (tablet->tool_state & (tablet->tool_state - 1)) {
 		evdev_log_bug_kernel(device,
 				     "Multiple tools active simultaneously (%#x)\n",
 				     tablet->tool_state);
@@ -1886,6 +1897,7 @@ tablet_reset_state(struct tablet_dispatch *tablet)
 	memcpy(&tablet->prev_button_state,
 	       &tablet->button_state,
 	       sizeof(tablet->button_state));
+	tablet_unset_status(tablet, TABLET_TOOL_UPDATED);
 }
 
 static void
@@ -2301,6 +2313,12 @@ tablet_init(struct tablet_dispatch *tablet,
 	}
 
 	tablet_set_status(tablet, TABLET_TOOL_OUT_OF_PROXIMITY);
+
+	/* We always enable the proximity out quirk, but disable it once a
+	   device gives us the right event sequence */
+	tablet->quirks.need_to_force_prox_out = true;
+	if (evdev_device_has_model_quirk(device, QUIRK_MODEL_WACOM_ISDV4_PEN))
+		tablet->quirks.need_to_force_prox_out = false;
 
 	libinput_timer_init(&tablet->quirks.prox_out_timer,
 			    tablet_libinput_context(tablet),

@@ -29,8 +29,23 @@
 #include <sys/stat.h>
 #include <libudev.h>
 
-#include "path-seat.h"
 #include "evdev.h"
+
+struct path_input {
+	struct libinput base;
+	struct udev *udev;
+	struct list path_list;
+};
+
+struct path_device {
+	struct list link;
+	struct udev_device *udev_device;
+};
+
+struct path_seat {
+	struct libinput_seat base;
+};
+
 
 static const char default_seat[] = "seat0";
 static const char default_seat_name[] = "default";
@@ -106,15 +121,15 @@ path_seat_get_named(struct path_input *input,
 	return NULL;
 }
 
-static struct libinput_device *
-path_device_enable(struct path_input *input,
-		   struct udev_device *udev_device,
-		   const char *seat_logical_name_override)
+static struct path_seat *
+path_seat_get_for_device(struct path_input *input,
+			 struct udev_device *udev_device,
+			 const char *seat_logical_name_override)
 {
-	struct path_seat *seat;
-	struct evdev_device *device = NULL;
+	struct path_seat *seat = NULL;
 	char *seat_name = NULL, *seat_logical_name = NULL;
-	const char *seat_prop, *output_name;
+	const char *seat_prop;
+
 	const char *devnode, *sysname;
 
 	devnode = udev_device_get_devnode(udev_device);
@@ -140,18 +155,40 @@ path_device_enable(struct path_input *input,
 
 	seat = path_seat_get_named(input, seat_name, seat_logical_name);
 
-	if (seat) {
-		libinput_seat_ref(&seat->base);
-	} else {
+	if (!seat)
 		seat = path_seat_create(input, seat_name, seat_logical_name);
-		if (!seat) {
-			log_info(&input->base,
-				 "%s: failed to create seat for device '%s'.\n",
-				 sysname,
-				 devnode);
-			goto out;
-		}
+	if (!seat) {
+		log_info(&input->base,
+			 "%s: failed to create seat for device '%s'.\n",
+			 sysname,
+			 devnode);
+		goto out;
 	}
+
+	libinput_seat_ref(&seat->base);
+out:
+	free(seat_name);
+	free(seat_logical_name);
+
+	return seat;
+}
+
+static struct libinput_device *
+path_device_enable(struct path_input *input,
+		   struct udev_device *udev_device,
+		   const char *seat_logical_name_override)
+{
+	struct path_seat *seat;
+	struct evdev_device *device = NULL;
+	const char *output_name;
+	const char *devnode, *sysname;
+
+	devnode = udev_device_get_devnode(udev_device);
+	sysname = udev_device_get_sysname(udev_device);
+
+	seat = path_seat_get_for_device(input, udev_device, seat_logical_name_override);
+	if (!seat)
+		goto out;
 
 	device = evdev_device_create(&seat->base, udev_device);
 	libinput_seat_unref(&seat->base);
@@ -176,9 +213,6 @@ path_device_enable(struct path_input *input,
 	device->output_name = safe_strdup(output_name);
 
 out:
-	free(seat_name);
-	free(seat_logical_name);
-
 	return device ? &device->base : NULL;
 }
 
@@ -199,6 +233,14 @@ path_input_enable(struct libinput *libinput)
 }
 
 static void
+path_device_destroy(struct path_device *dev)
+{
+	list_remove(&dev->link);
+	udev_device_unref(dev->udev_device);
+	free(dev);
+}
+
+static void
 path_input_destroy(struct libinput *input)
 {
 	struct path_input *path_input = (struct path_input*)input;
@@ -206,10 +248,8 @@ path_input_destroy(struct libinput *input)
 
 	udev_unref(path_input->udev);
 
-	list_for_each_safe(dev, tmp, &path_input->path_list, link) {
-		udev_device_unref(dev->udev_device);
-		free(dev);
-	}
+	list_for_each_safe(dev, tmp, &path_input->path_list, link)
+		path_device_destroy(dev);
 
 }
 
@@ -229,11 +269,8 @@ path_create_device(struct libinput *libinput,
 
 	device = path_device_enable(input, udev_device, seat_name);
 
-	if (!device) {
-		udev_device_unref(dev->udev_device);
-		list_remove(&dev->link);
-		free(dev);
-	}
+	if (!device)
+		path_device_destroy(dev);
 
 	return device;
 }
@@ -343,13 +380,6 @@ libinput_path_add_device(struct libinput *libinput,
 		return NULL;
 	}
 
-	/* We cannot do this during path_create_context because the log
-	 * handler isn't set up there but we really want to log to the right
-	 * place if the quirks run into parser errors. So we have to do it
-	 * on the first call to add_device.
-	 */
-	libinput_init_quirks(libinput);
-
 	udev_device = udev_device_from_devnode(libinput, udev, path);
 	if (!udev_device) {
 		log_bug_client(libinput, "Invalid path %s\n", path);
@@ -360,6 +390,13 @@ libinput_path_add_device(struct libinput *libinput,
 		udev_device_unref(udev_device);
 		return NULL;
 	}
+
+	/* We cannot do this during path_create_context because the log
+	 * handler isn't set up there but we really want to log to the right
+	 * place if the quirks run into parser errors. So we have to do it
+	 * on the first call to add_device.
+	 */
+	libinput_init_quirks(libinput);
 
 	device = path_create_device(libinput, udev_device, NULL);
 	udev_device_unref(udev_device);
@@ -382,9 +419,7 @@ libinput_path_remove_device(struct libinput_device *device)
 
 	list_for_each(dev, &input->path_list, link) {
 		if (dev->udev_device == evdev->udev_device) {
-			list_remove(&dev->link);
-			udev_device_unref(dev->udev_device);
-			free(dev);
+			path_device_destroy(dev);
 			break;
 		}
 	}
